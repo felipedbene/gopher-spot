@@ -152,6 +152,10 @@ mod net {
     const TOKEN_URL: &str = "https://accounts.spotify.com/api/token";
     const DEVICE_NAME: &str = "gopher-spot";
     const SEARCH_TTL: i64 = 300; // 5 min
+    // Spotify's /v1/search rejects limit=20 with 400 "Invalid limit" (the docs
+    // still say 0-50, but 20 empirically 400s and 10 works — an API quirk). 10 is
+    // plenty for a Gopher menu.
+    const SEARCH_LIMIT: u32 = 10;
     const DEVICES_TTL: i64 = 30; // 30 s
     const PLAYLISTS_TTL: i64 = 60; // 60 s
     const HTTP_TIMEOUT_SECS: u64 = 10;
@@ -315,7 +319,7 @@ mod net {
                 return serde_json::from_str(&c).map_err(|e| e.to_string());
             }
             let path = format!(
-                "/v1/search?type=track,album,artist&limit=20&q={}",
+                "/v1/search?type=track,album,artist&limit={SEARCH_LIMIT}&q={}",
                 urlencode(query)
             );
             let body = self.get(&path)?.into_string().map_err(|e| e.to_string())?;
