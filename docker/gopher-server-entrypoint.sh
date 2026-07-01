@@ -9,6 +9,11 @@
 set -eu
 
 : "${AUDIO_STREAM_URL:=http://audio-stream.lan:8000/spotify.mp3}"
+# geomyidae listens on and advertises this port (the `port` token in links). 70
+# in-cluster; override for local testing where a privileged host port is awkward
+# (must match the published port so link-following works). setcap lets nobody
+# bind < 1024.
+: "${GOPHER_PORT:=70}"
 
 # geomyidae substitutes the `server`/`port` tokens in every link with $GOPHER_HOST
 # (-h) and the listen port. On the LAN we want links to dial back the
@@ -27,7 +32,7 @@ Version=2
 EOF
 echo "gopher-server: stream.pls -> ${AUDIO_STREAM_URL}" >&2
 
-set -- geomyidae -d -b /srv -p 70
+set -- geomyidae -d -b /srv -p "$GOPHER_PORT"
 [ -n "$GOPHER_HOST" ] && set -- "$@" -h "$GOPHER_HOST"
 echo "gopher-server: exec $*" >&2
 exec "$@"
