@@ -201,7 +201,7 @@ is realized as a file TTL cache in `$SPOT_STATE_DIR` (an emptyDir): access token
 
 ### OAuth (one-shot, on a LAN box with a browser)
 
-Set the app's redirect URI to exactly `http://localhost:8888/callback`, then:
+Set the app's redirect URI to exactly `http://127.0.0.1:8888/callback`, then:
 
 ```sh
 SPOTIFY_CLIENT_ID=... SPOTIFY_CLIENT_SECRET=... ./scripts/spotify-oauth-init.sh

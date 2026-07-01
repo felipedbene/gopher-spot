@@ -77,7 +77,9 @@ mod oauth {
     use std::net::TcpListener;
     use std::process::ExitCode;
 
-    const REDIRECT: &str = "http://localhost:8888/callback";
+    // Spotify deprecated `localhost` in redirect URIs — the loopback must be the
+    // explicit IP. Register exactly this in the app's Redirect URIs.
+    const REDIRECT: &str = "http://127.0.0.1:8888/callback";
     const SCOPES: &str = "user-read-private user-read-playback-state \
         user-modify-playback-state user-read-currently-playing \
         playlist-read-private playlist-read-collaborative user-library-read";

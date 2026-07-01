@@ -6,7 +6,7 @@
 #   # or drop them in a gitignored .env next to this repo, or enter interactively
 #
 # Prereqs on the Spotify app (developer.spotify.com/dashboard):
-#   Redirect URI must include exactly:  http://localhost:8888/callback
+#   Redirect URI must include exactly:  http://127.0.0.1:8888/callback
 #
 # The heavy lifting (browser URL, :8888 callback listener, token exchange) is in
 # the Rust binary's `oauth-init` subcommand; this wrapper just feeds it creds and
