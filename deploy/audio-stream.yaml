@@ -21,6 +21,14 @@ spec:
       labels:
         app: audio-stream
     spec:
+      # Pull creds for the private ghcr packages. Harmless if you make the
+      # packages public instead (a missing pull Secret is just a warning; the
+      # anonymous pull still succeeds). Create with:
+      #   kubectl -n gopher-spot create secret docker-registry ghcr-pull \
+      #     --docker-server=ghcr.io --docker-username=felipedbene \
+      #     --docker-password=<PAT with read:packages>
+      imagePullSecrets:
+        - name: ghcr-pull
       # No hostNetwork, no nodeSelector — scheduler decides (PROMPT constraint).
       # The image is multi-arch, so it runs on amd64 or arm64 nodes alike.
       containers:

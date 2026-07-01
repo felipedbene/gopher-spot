@@ -11,7 +11,7 @@ data:
   # LAN-reachable IP, NOT a cluster DNS name. Fill in after the audio-stream
   # Service gets its MetalLB IP (pool is 10.0.100.x, not the 10.0.10.x the PROMPT
   # guessed).
-  AUDIO_STREAM_URL: "http://10.0.100.___:8000/spotify.mp3"
+  AUDIO_STREAM_URL: "http://10.0.100.113:8000/spotify.mp3"
   # The gopher-server LB IP (or gopher-spot.lan): geomyidae stamps it into every
   # link's host token so TurboGopher follows links back to the right address.
   # Assigned by MetalLB on first apply.
@@ -34,6 +34,10 @@ spec:
       labels:
         app: gopher-server
     spec:
+      # Pull creds for the private ghcr packages (see audio-stream.yaml). Harmless
+      # if you make the packages public instead.
+      imagePullSecrets:
+        - name: ghcr-pull
       # No hostNetwork, no nodeSelector — scheduler decides. Multi-arch image.
       # fsGroup so nobody (65534) can write the cache emptyDir below.
       securityContext:
