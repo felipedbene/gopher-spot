@@ -1,0 +1,11 @@
+# Rust
+/target
+Cargo.lock          # binary crate, but we pin core by tag; lockfile churns per-arch
+
+# Secrets — ONLY the template is committed
+/deploy/secrets.yaml
+.env
+deploy/.env
+
+# OS junk
+.DS_Store

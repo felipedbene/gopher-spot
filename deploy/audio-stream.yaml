@@ -1,0 +1,87 @@
+# audio-stream: single librespot|ffmpeg pod exposing MP3 over HTTP on a MetalLB
+# LoadBalancer IP. One replica (librespot is one device), Recreate strategy (a
+# single live stream — a rolling second pod would fight for the same Connect
+# device name and split the audio).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: audio-stream
+  namespace: gopher-spot
+  labels:
+    app: audio-stream
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: audio-stream
+  template:
+    metadata:
+      labels:
+        app: audio-stream
+    spec:
+      # No hostNetwork, no nodeSelector — scheduler decides (PROMPT constraint).
+      # The image is multi-arch, so it runs on amd64 or arm64 nodes alike.
+      containers:
+        - name: audio-stream
+          image: ghcr.io/felipedbene/gopher-spot-audio:latest
+          imagePullPolicy: Always
+          env:
+            # zeroconf does NOT work from an overlay pod (mDNS never reaches the
+            # LAN without hostNetwork). credentials mode logs into Spotify's AP
+            # and appears as a Connect device via Spotify's backend. Seed
+            # credentials.json once (see scripts/spotify-oauth-init.sh notes) and
+            # mount it as the `librespot-credentials` Secret below, then flip this
+            # to "credentials". Shipped as zeroconf so `docker run` still works.
+            - name: LIBRESPOT_MODE
+              value: "zeroconf"
+            - name: LIBRESPOT_NAME
+              value: "gopher-spot"
+          ports:
+            - name: http-mp3
+              containerPort: 8000
+          # NO readiness/liveness probe on :8000 — ffmpeg's `-listen 1` HTTP
+          # server accepts exactly ONE client, so a TCP/HTTP probe would consume
+          # the single stream slot and starve the real listener. Health is
+          # observed out-of-band (does VLC hear audio).
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            # emptyDir cache (Q3: emptyDir, not PVC — see README). Unused in
+            # zeroconf mode; in credentials mode the entrypoint reads
+            # credentials.json from here, seeded by the Secret projection.
+            - name: cache
+              mountPath: /cache
+      volumes:
+        - name: cache
+          emptyDir: {}
+        # When you switch to credentials mode, replace the emptyDir above with a
+        # projection that lands credentials.json into /cache, e.g.:
+        #   - name: cache
+        #     secret:
+        #       secretName: librespot-credentials
+        #       items:
+        #         - key: credentials.json
+        #           path: credentials.json
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: audio-stream
+  namespace: gopher-spot
+  labels:
+    app: audio-stream
+spec:
+  type: LoadBalancer
+  ports:
+    - port: 8000
+      targetPort: 8000
+      name: http-mp3
+  selector:
+    app: audio-stream
