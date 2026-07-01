@@ -121,6 +121,57 @@ Local smoke test without k8s:
 
 ```sh
 docker build -f docker/audio-stream.Dockerfile -t gopher-spot-audio .
-docker run --rm --network host gopher-spot-audio   # zeroconf mode; pick from phone
+docker run --rm --network host -e LIBRESPOT_MODE=zeroconf gopher-spot-audio  # pick from phone
 # open http://localhost:8000/spotify.mp3 in VLC
 ```
+
+## Fio B — gopher-server + dcgi skeleton
+
+geomyidae serves `/srv`. Routing (verified against geomyidae's CGI.md):
+
+- `/` → static baked `/srv/index.gph` (the root menu).
+- `/spot/*` → `/srv/spot/index.dcgi` (a one-line wrapper → `gopher-spot dcgi`),
+  which geomyidae runs as the `index.dcgi` fallback for any non-existent path
+  under `/spot`, passing `$search $arguments $host $port $traversal $selector`
+  and interpreting stdout as a gophermap. The dcgi routes on the selector.
+- `/spot/stream.pls` → a **real file** (raw, type-`s`), generated at startup from
+  `$AUDIO_STREAM_URL`. It must be a file, not dcgi output, because a `.pls` is
+  served verbatim, not interpreted as a menu.
+
+Fio B endpoints are mock (no Web API yet). Verified locally with lynx: root menu,
+all `/spot/*` mock routes, the type-7 search passing its query to the dcgi, the
+raw PLS, and the unknown-route fallback all render as clean tabless gophermaps.
+
+```sh
+./scripts/buildx.sh server
+kubectl apply -f deploy/gopher-server.yaml   # ConfigMap + Deployment(2) + Service LB
+kubectl -n gopher-spot get svc gopher-server -o wide
+# then: lynx gopher://<gopher-server-lb-ip>:70/   and validate in TurboGopher (Fio D)
+```
+
+Local smoke test:
+
+```sh
+docker build -f docker/gopher-server.Dockerfile -t gopher-spot-server .
+docker run --rm -p 7070:70 -e AUDIO_STREAM_URL=http://10.0.10.8:8000/spotify.mp3 \
+  -e GOPHER_HOST=127.0.0.1 gopher-spot-server
+lynx gopher://127.0.0.1:7070/1/
+```
+
+Two gotchas worth noting:
+
+- **Privileged port :70 as non-root.** geomyidae carries a file capability
+  (`setcap cap_net_bind_service=+ep`) so `nobody` can bind :70; the Deployment
+  keeps `NET_BIND_SERVICE` in the bounding set and `allowPrivilegeEscalation:
+  true` (required for a file cap to raise).
+- **`GOPHER_HOST`.** geomyidae stamps this into every link's host token. In-
+  cluster it must be the gopher-server LB IP (or `gopher-spot.lan`), else links
+  won't follow from the Mac. Chicken-and-egg: apply once, read the assigned IP,
+  set it in the ConfigMap, re-apply.
+
+### MacRoman note (matters from Fio C on)
+
+Fio B display text is all ASCII, so UTF-8 == MacRoman on the wire and TurboGopher
+renders it clean (there's a test guarding this). Once Fio C echoes Spotify track/
+artist names (accents, non-Latin scripts), those dynamic strings need a UTF-8 →
+MacRoman transcode at the IO edge.

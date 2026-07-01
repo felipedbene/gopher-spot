@@ -5,6 +5,6 @@ namespace: gopher-spot
 resources:
   - namespace.yaml
   - audio-stream.yaml
-  # - gopher-server.yaml   # added in Fio B
+  - gopher-server.yaml
   # - secrets.yaml         # created from secrets.yaml.template by the OAuth init
   #                        # script (Fio C); gitignored, never committed.

@@ -1,0 +1,92 @@
+# gopher-server: geomyidae + the gopher-spot dcgi on :70 behind a MetalLB
+# LoadBalancer. Stateless (replicas 2, RollingUpdate) — the dcgi holds no state,
+# and Fio C's Web API caches are per-process (fine to duplicate across replicas).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gopher-server-config
+  namespace: gopher-spot
+data:
+  # The audio-stream LoadBalancer, as the OS 9 box will dial it. Must be a
+  # LAN-reachable IP, NOT a cluster DNS name. Fill in after the audio-stream
+  # Service gets its MetalLB IP.
+  AUDIO_STREAM_URL: "http://10.0.10.___:8000/spotify.mp3"
+  # The gopher-server LB IP (or gopher-spot.lan): geomyidae stamps it into every
+  # link's host token so TurboGopher follows links back to the right address.
+  # Fill in after this Service gets its MetalLB IP (chicken-and-egg: apply once,
+  # read the IP, set this, re-apply).
+  GOPHER_HOST: "10.0.10.___"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gopher-server
+  namespace: gopher-spot
+  labels:
+    app: gopher-server
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: gopher-server
+  template:
+    metadata:
+      labels:
+        app: gopher-server
+    spec:
+      # No hostNetwork, no nodeSelector — scheduler decides. Multi-arch image.
+      containers:
+        - name: gopher-server
+          image: ghcr.io/felipedbene/gopher-spot-server:latest
+          imagePullPolicy: Always
+          envFrom:
+            - configMapRef:
+                name: gopher-server-config
+            # Fio C adds: secretRef spotify-oauth (Web API creds).
+          ports:
+            - name: gopher
+              containerPort: 70
+          securityContext:
+            # geomyidae binds :70 as nobody via the file capability baked into
+            # the binary; NET_BIND_SERVICE must stay in the bounding set for that
+            # to raise. runAsNonRoot keeps it unprivileged otherwise.
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            allowPrivilegeEscalation: true
+            capabilities:
+              drop: ["ALL"]
+              add: ["NET_BIND_SERVICE"]
+          readinessProbe:
+            tcpSocket:
+              port: 70
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 70
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gopher-server
+  namespace: gopher-spot
+  labels:
+    app: gopher-server
+spec:
+  type: LoadBalancer
+  ports:
+    - port: 70
+      targetPort: 70
+      name: gopher
+  selector:
+    app: gopher-server

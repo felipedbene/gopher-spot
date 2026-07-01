@@ -1,6 +1,8 @@
 # Rust
 /target
-Cargo.lock          # binary crate, but we pin core by tag; lockfile churns per-arch
+# Binary crate, but gopher-core is pinned by tag and the image build doesn't use
+# --locked, so the lockfile adds little and churns per-arch. Matches gopher-core.
+Cargo.lock
 
 # Secrets — ONLY the template is committed
 /deploy/secrets.yaml
