@@ -102,7 +102,7 @@ sleep 3
 (
   while true; do
     ffmpeg -hide_banner -loglevel error -re -f lavfi -i anullsrc=r=44100:cl=stereo \
-      -c:a libmp3lame -b:a "$MP3_BITRATE" -f mp3 -legacy_icecast 1 \
+      -c:a libmp3lame -b:a "$MP3_BITRATE" -write_xing 0 -f mp3 -legacy_icecast 1 \
       -content_type audio/mpeg "$(ice_url silence.mp3)" || true
     sleep 2
   done
@@ -114,7 +114,7 @@ sleep 3
 while true; do
   librespot "$@" \
     | ffmpeg -hide_banner -loglevel warning -re -f s16le -ar 44100 -ac 2 -i pipe:0 \
-             -c:a libmp3lame -b:a "$MP3_BITRATE" -f mp3 -legacy_icecast 1 \
+             -c:a libmp3lame -b:a "$MP3_BITRATE" -write_xing 0 -f mp3 -legacy_icecast 1 \
              -content_type audio/mpeg "$(ice_url spotify.mp3)" || true
   echo "audio-stream: live source ended, respawning in 2s" >&2
   sleep 2
