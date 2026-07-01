@@ -28,14 +28,14 @@ spec:
           image: ghcr.io/felipedbene/gopher-spot-audio:latest
           imagePullPolicy: Always
           env:
-            # zeroconf does NOT work from an overlay pod (mDNS never reaches the
-            # LAN without hostNetwork). credentials mode logs into Spotify's AP
-            # and appears as a Connect device via Spotify's backend. Seed
-            # credentials.json once (see scripts/spotify-oauth-init.sh notes) and
-            # mount it as the `librespot-credentials` Secret below, then flip this
-            # to "credentials". Shipped as zeroconf so `docker run` still works.
+            # credentials mode: zeroconf can't cross an overlay pod without
+            # hostNetwork (forbidden), so librespot logs into Spotify's AP with a
+            # cached credentials.json and appears as a Connect device via
+            # Spotify's backend (outbound HTTPS only). The credentials.json comes
+            # from the `librespot-credentials` Secret, mounted read-only at /seed
+            # and copied into the writable /cache emptyDir by the entrypoint.
             - name: LIBRESPOT_MODE
-              value: "zeroconf"
+              value: "credentials"
             - name: LIBRESPOT_NAME
               value: "gopher-spot"
           ports:
@@ -53,22 +53,25 @@ spec:
               cpu: 500m
               memory: 256Mi
           volumeMounts:
-            # emptyDir cache (Q3: emptyDir, not PVC — see README). Unused in
-            # zeroconf mode; in credentials mode the entrypoint reads
-            # credentials.json from here, seeded by the Secret projection.
+            # Writable cache (Q3: emptyDir, not PVC — a PVC would be RWO and pin
+            # the pod to a node, fighting "scheduler decides"). librespot rewrites
+            # credentials.json here; on restart the entrypoint re-seeds from /seed.
             - name: cache
               mountPath: /cache
+            # The player credentials.json, read-only, seeded once from a local
+            # zeroconf login. Distinct from the Web API OAuth (Fio C).
+            - name: credentials-seed
+              mountPath: /seed
+              readOnly: true
       volumes:
         - name: cache
           emptyDir: {}
-        # When you switch to credentials mode, replace the emptyDir above with a
-        # projection that lands credentials.json into /cache, e.g.:
-        #   - name: cache
-        #     secret:
-        #       secretName: librespot-credentials
-        #       items:
-        #         - key: credentials.json
-        #           path: credentials.json
+        - name: credentials-seed
+          secret:
+            secretName: librespot-credentials
+            items:
+              - key: credentials.json
+                path: credentials.json
 ---
 apiVersion: v1
 kind: Service

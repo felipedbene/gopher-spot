@@ -29,7 +29,20 @@ librespot_common="--backend pipe --name ${LIBRESPOT_NAME} \
 
 case "$LIBRESPOT_MODE" in
   credentials)
-    # credentials.json lives at $LIBRESPOT_CACHE/credentials.json (Secret).
+    # librespot logs into Spotify's AP with credentials.json under $LIBRESPOT_CACHE
+    # and REWRITES it, so the cache dir must be writable (emptyDir). The Secret is
+    # mounted read-only at $LIBRESPOT_SEED; seed it into the writable cache once,
+    # if not already there.
+    LIBRESPOT_SEED="${LIBRESPOT_SEED:-/seed/credentials.json}"
+    if [ ! -f "$LIBRESPOT_CACHE/credentials.json" ] && [ -f "$LIBRESPOT_SEED" ]; then
+      mkdir -p "$LIBRESPOT_CACHE"
+      cp "$LIBRESPOT_SEED" "$LIBRESPOT_CACHE/credentials.json"
+      echo "audio-stream: seeded credentials.json from $LIBRESPOT_SEED" >&2
+    fi
+    if [ ! -f "$LIBRESPOT_CACHE/credentials.json" ]; then
+      echo "audio-stream: no credentials.json at $LIBRESPOT_CACHE (seed the librespot-credentials Secret)" >&2
+      exit 65
+    fi
     set -- $librespot_common --cache "$LIBRESPOT_CACHE" --disable-audio-cache
     ;;
   zeroconf)
