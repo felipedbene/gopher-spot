@@ -15,10 +15,12 @@ This project does **not** touch the VPS `gopher.debene.dev`. Homelab k8s only.
 
 ## LoadBalancer IPs (fill in after first apply)
 
-| Service        | Port | LAN IP        | `.lan` name (Technitium) |
-|----------------|------|---------------|--------------------------|
-| audio-stream   | 8000 | `10.0.10.___` | `audio-stream.lan`       |
-| gopher-server  | 70   | `10.0.10.___` | `gopher-spot.lan`        |
+MetalLB pool turned out to be `10.0.100.x` (the PROMPT guessed `10.0.10.x`).
+
+| Service        | Port | LAN IP          | `.lan` name (Technitium) |
+|----------------|------|-----------------|--------------------------|
+| audio-stream   | 8000 | `10.0.100.___`  | `audio-stream.lan`       |
+| gopher-server  | 70   | `10.0.100.112`  | `gopher-spot.lan`        |
 
 ```sh
 kubectl -n gopher-spot get svc -o wide   # read EXTERNAL-IP here
