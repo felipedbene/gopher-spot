@@ -30,11 +30,16 @@ kubectl -n gopher-spot get svc -o wide   # read EXTERNAL-IP here
 
 ## Design decisions (answers to the three PROMPT questions)
 
-1. **librespot: build from source.** No official static multi-arch binaries
-   exist, and building lets us `--no-default-features` to drop every system
-   audio backend (alsa/pulse/rodio/portaudio/jack) *and* libmdns. The pipe
-   backend is always compiled and is all we need. Smaller image, no C audio
-   deps. Pinned to `LIBRESPOT_VERSION` in the Dockerfile.
+1. **librespot: build from source, from the `dev` branch (0.8.0).** No official
+   static multi-arch binaries exist, and building lets us `--no-default-features`
+   to drop every system audio backend (alsa/pulse/rodio/portaudio/jack) *and*
+   libmdns — the always-compiled pipe backend is all we need. **We build the dev
+   branch, not the 0.6.0 crates.io release:** after a Spotify server-side change
+   (~Nov 2025, [librespot #1623](https://github.com/librespot-org/librespot/issues/1623))
+   0.6.0 can't load any track ("not available in any supported format") — auth
+   works, playback is dead; dev (0.8.0) fixes it. Pinned to `LIBRESPOT_REV`; TLS
+   is rustls-webpki (dev requires an explicit TLS backend). Bump when a fixed
+   release lands.
 
 2. **gopher-server: one image.** geomyidae + the dcgi binary in a single image;
    geomyidae execs the dcgi by `.dcgi` extension + exec bit (the sibling

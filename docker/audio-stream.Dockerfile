@@ -15,24 +15,24 @@
 # with no multi-arch apk). Flagged in README; not chased here.
 
 # --- 1. Build librespot from source, minimal features ----------------------
+# We build from the librespot **dev branch (0.8.0)**, NOT the last crates.io
+# release (0.6.0): after a Spotify server-side change (~Nov 2025, librespot
+# #1623) 0.6.0 can no longer load ANY track ("not available in any supported
+# format") — auth works, playback is dead. The dev branch fixes it (verified:
+# it loads + streams). Pinned to a commit for reproducibility; bump when a fixed
+# release lands.
+#
 # --no-default-features drops the alsa/pulse/rodio/portaudio/jack backends AND
-# libmdns (zeroconf discovery). The pipe backend is always compiled and needs no
-# feature. We run in *credentials* mode (Spotify AP login, appears as a Connect
-# device via Spotify's backend) rather than LAN zeroconf — see README "Discovery"
-# for why that matters under the no-hostNetwork constraint.
+# libmdns (zeroconf) — we use the always-compiled pipe backend + credentials mode
+# (see README "Discovery"). On dev the TLS backend must be selected explicitly,
+# so we pick rustls-webpki (ring, musl-friendly, host-independent CA bundle — no
+# openssl needed anymore).
 FROM rust:alpine AS build
-RUN apk add --no-cache \
-      musl-dev pkgconfig \
-      openssl-dev openssl-libs-static \
-      protobuf-dev protoc \
-      cmake make g++ git
-# librespot's TLS via openssl-sys, statically linked against musl.
-ENV OPENSSL_STATIC=1 OPENSSL_LIB_DIR=/usr/lib OPENSSL_INCLUDE_DIR=/usr/include
-ARG LIBRESPOT_VERSION=0.6.0
+RUN apk add --no-cache musl-dev pkgconfig protobuf-dev protoc cmake make g++ git
+ARG LIBRESPOT_REV=db1ef7ab8c5ebd78edea0ba20f34feb21bd0e195
 RUN cargo install librespot \
-      --version ${LIBRESPOT_VERSION} \
-      --no-default-features \
-      --locked \
+      --git https://github.com/librespot-org/librespot --rev ${LIBRESPOT_REV} \
+      --no-default-features --features rustls-tls-webpki-roots \
       --root /out \
  && strip /out/bin/librespot \
  && /out/bin/librespot --version
