@@ -37,13 +37,16 @@ RUN cargo install librespot \
  && strip /out/bin/librespot \
  && /out/bin/librespot --version
 
-# --- 2. Runtime: alpine + ffmpeg + the librespot binary + entrypoint --------
+# --- 2. Runtime: alpine + ffmpeg + icecast + librespot + entrypoint ---------
+# icecast is the persistent streaming server (see the entrypoint for why); ffmpeg
+# encodes librespot's PCM (and the silence fallback) to MP3.
 FROM alpine:3.20
-RUN apk add --no-cache ffmpeg
+RUN apk add --no-cache ffmpeg icecast
 COPY --from=build /out/bin/librespot /usr/local/bin/librespot
 COPY docker/audio-stream-entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod 0755 /usr/local/bin/entrypoint.sh
-# 8000 is unprivileged, so we run as nobody (no cap needed to bind it).
+# 8000 is unprivileged, so we run as nobody (icecast + the entrypoint write only
+# to /tmp and the /cache mount).
 USER nobody:nobody
 EXPOSE 8000
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

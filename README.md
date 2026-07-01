@@ -88,13 +88,29 @@ kubectl -n gopher-spot create secret generic librespot-credentials \
 (This is the player identity, distinct from the Web API OAuth Secret in Fio C.
 `deploy/secrets.yaml.template` documents both.)
 
+## Audio delivery: Icecast (not `-listen 1`)
+
+The audio-stream container runs **Icecast**, a persistent streaming server, fed by
+`librespot | ffmpeg`. The earlier `ffmpeg -listen 1` design was too fragile: it
+served exactly one client, only while a track was actively producing PCM, and
+dropped on every pause/track-gap → the client got "connection refused" most of the
+time. Icecast fixes all three:
+
+- **Always up / never refused:** a `/silence.mp3` fallback plays when idle, and
+  `/spotify.mp3` (`fallback-mount=/silence.mp3`, `fallback-override`) snaps to live
+  audio when a track plays. Audion parks on `:8000/spotify.mp3` and stays.
+- **Multi-client:** many listeners off one source.
+- **Survives idle/track changes** via the fallback.
+
+Clients still only dial `:8000/spotify.mp3`, so nothing changed for the dcgi, the
+`.pls`, or the Service.
+
 ## Image size note
 
-The `<40MB` target for audio-stream is unlikely with alpine's `ffmpeg` apk,
-which pulls ~30-40MB of libav*/lame/protocol shared objects. Expect ~50-60MB.
-Getting under 40MB means a hand-built minimal static ffmpeg for both arches (no
-multi-arch apk exists) — a rabbit hole I did not chase. Say the word if the size
-matters more than build simplicity.
+The audio-stream image is ~140MB — over the PROMPT's `<40MB` target. alpine's
+`ffmpeg` apk alone pulls ~30-40MB of libav*/lame/protocol libs, plus icecast and
+the (fat, tokio/rustls/hyper) librespot binary. Shrinking would mean a hand-built
+minimal static ffmpeg for both arches — a rabbit hole not chased; LAN pulls once.
 
 ---
 

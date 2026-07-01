@@ -49,10 +49,19 @@ spec:
           ports:
             - name: http-mp3
               containerPort: 8000
-          # NO readiness/liveness probe on :8000 — ffmpeg's `-listen 1` HTTP
-          # server accepts exactly ONE client, so a TCP/HTTP probe would consume
-          # the single stream slot and starve the real listener. Health is
-          # observed out-of-band (does VLC hear audio).
+          # Icecast is a persistent multi-client server, so a TCP probe on :8000
+          # is safe now (the old `-listen 1` design had none, because a probe
+          # would have stolen its single stream slot).
+          readinessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 20
           resources:
             requests:
               cpu: 100m
