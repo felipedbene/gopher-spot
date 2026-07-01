@@ -9,5 +9,10 @@ Cargo.lock
 .env
 deploy/.env
 
+# librespot local seed (zeroconf login cache) — holds the player credentials.json
+/c/
+credentials.json
+*.credentials
+
 # OS junk
 .DS_Store
