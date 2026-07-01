@@ -13,6 +13,19 @@ use gopher_core::{info, link, render_menu_index, Entry, ItemKind};
 /// RFC 1436 display-width budget (PROMPT constraint).
 pub const MAX_WIDTH: usize = 66;
 
+/// Clip a (possibly multi-byte) display string to [`MAX_WIDTH`] columns, adding
+/// an ellipsis when it overflows. Counts chars, not bytes, so accents don't eat
+/// budget; the MacRoman transcode at the IO edge maps each char to one byte.
+pub fn clip(s: &str) -> String {
+    let n = s.chars().count();
+    if n <= MAX_WIDTH {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(MAX_WIDTH - 3).collect();
+    out.push_str("...");
+    out
+}
+
 /// The static root menu (PROMPT's selector list). A fixed set of links; the
 /// endpoints behind them are wired in later fios.
 pub fn root_entries() -> Vec<Entry> {

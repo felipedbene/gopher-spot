@@ -35,6 +35,9 @@ spec:
         app: gopher-server
     spec:
       # No hostNetwork, no nodeSelector — scheduler decides. Multi-arch image.
+      # fsGroup so nobody (65534) can write the cache emptyDir below.
+      securityContext:
+        fsGroup: 65534
       containers:
         - name: gopher-server
           image: ghcr.io/felipedbene/gopher-spot-server:latest
@@ -42,7 +45,16 @@ spec:
           envFrom:
             - configMapRef:
                 name: gopher-server-config
-            # Fio C adds: secretRef spotify-oauth (Web API creds).
+            # Web API OAuth creds. optional: the pod still starts without the
+            # Secret and the dcgi serves the offline mock menus (graceful).
+            - secretRef:
+                name: spotify-oauth
+                optional: true
+          env:
+            # Writable dir for the disk cache (access token, search 5min, devices
+            # 30s). A per-request dcgi can't hold an in-process cache.
+            - name: SPOT_STATE_DIR
+              value: /var/cache/spot
           ports:
             - name: gopher
               containerPort: 70
@@ -74,6 +86,14 @@ spec:
             limits:
               cpu: 200m
               memory: 128Mi
+          volumeMounts:
+            - name: cache
+              mountPath: /var/cache/spot
+      volumes:
+        # Per-replica disk cache for the token + Web API results. emptyDir: it's
+        # a warm cache, nothing to persist across restarts.
+        - name: cache
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service

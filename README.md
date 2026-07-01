@@ -171,9 +171,50 @@ Two gotchas worth noting:
   won't follow from the Mac. Chicken-and-egg: apply once, read the assigned IP,
   set it in the ConfigMap, re-apply.
 
-### MacRoman note (matters from Fio C on)
+### MacRoman note
 
-Fio B display text is all ASCII, so UTF-8 == MacRoman on the wire and TurboGopher
-renders it clean (there's a test guarding this). Once Fio C echoes Spotify track/
-artist names (accents, non-Latin scripts), those dynamic strings need a UTF-8 →
-MacRoman transcode at the IO edge.
+Fio B display text is all ASCII, so UTF-8 == MacRoman on the wire. Fio C echoes
+Spotify track/artist names (accents, smart quotes), so the whole rendered
+gophermap is transcoded to MacRoman at the IO edge (`macroman::encode` in
+`main.rs`): ASCII — including every structural `[ ] | \t \n` byte — is identity,
+and only accented display bytes are remapped (e.g. `ção` → `8d 8b 6f`, not the
+UTF-8 `c3a7 c3a3`). Unmappable codepoints (CJK, emoji) become `?`.
+
+## Fio C — OAuth + Web API
+
+The dcgi drives the Spotify Web API with **blocking ureq** (a per-request dcgi
+wants no async runtime) against the `gopher-spot` Connect device. `net` is a
+default feature; `cargo test --no-default-features` builds the pure offline core.
+
+Endpoints: `/spot/now` (currently-playing), `/spot/search` (type-7 → tracks as
+`/spot/track/{id}` links + artist/album context), `/spot/track/{id}` (detail +
+`>> Tocar agora` → `/spot/play?uri=...`), `/spot/play?uri=...` (PUT play on the
+device), `/spot/control/{pause,next,prev,vol/N}`.
+
+**Caching is on disk, not "in memory".** A dcgi is exec'd per request, so an
+in-process cache never survives between requests — the PROMPT's "cache em memória"
+is realized as a file TTL cache in `$SPOT_STATE_DIR` (an emptyDir): access token
+(`expires_in − 60s`), search (5 min), devices (30 s). Per-replica, which is fine.
+
+**Graceful degradation.** The `spotify-oauth` Secret is `optional: true` in
+`envFrom`; with no creds the dcgi serves the Fio B mock menus instead of crashing.
+
+### OAuth (one-shot, on a LAN box with a browser)
+
+Set the app's redirect URI to exactly `http://localhost:8888/callback`, then:
+
+```sh
+SPOTIFY_CLIENT_ID=... SPOTIFY_CLIENT_SECRET=... ./scripts/spotify-oauth-init.sh
+# opens an auth URL, catches the callback on :8888, mints a refresh token,
+# writes deploy/secrets.yaml (gitignored)
+kubectl apply -f deploy/secrets.yaml
+kubectl rollout restart deployment/gopher-server -n gopher-spot
+```
+
+Scopes: `user-read-private user-read-playback-state user-modify-playback-state
+user-read-currently-playing playlist-read-private playlist-read-collaborative
+user-library-read`.
+
+**Validation** (needs audio-stream up so the `gopher-spot` device exists): from
+OS 9, Buscar → "chico buarque" → "Construção" → `>> Tocar agora`, hear it in
+Audion (parked on the audio LB bookmark).

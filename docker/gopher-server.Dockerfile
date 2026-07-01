@@ -12,9 +12,12 @@
 # baked static /srv/index.gph; stream.pls is a real file (raw, type-s) generated
 # at startup from $AUDIO_STREAM_URL.
 
-# --- 1. Build the dcgi binary (musl static; gopher-core is std-only) --------
+# --- 1. Build the dcgi binary (musl static) ---------------------------------
+# gopher-core is std-only, but the `net` feature (default) pulls ureq -> rustls
+# -> ring, whose build.rs needs a C toolchain (build-base). perl isn't needed:
+# ring 0.17 ships pregenerated asm.
 FROM rust:alpine AS build
-RUN apk add --no-cache musl-dev git ca-certificates
+RUN apk add --no-cache build-base musl-dev git ca-certificates
 WORKDIR /src
 COPY Cargo.toml ./
 COPY src ./src

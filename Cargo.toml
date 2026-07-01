@@ -13,17 +13,27 @@ path = "src/lib.rs"
 name = "gopher-spot"
 path = "src/main.rs"
 
-# The Web API client (search/control/now-playing) lands in Fio C behind a `net`
-# feature, mirroring gopher-askthedeck: a dcgi is a short-lived per-request
-# process, so it uses BLOCKING ureq (no tokio) — decided with the maintainer.
-# Fio B is the offline skeleton, so no net deps yet.
-# [features]
-# net = ["dep:ureq", "dep:serde", "dep:serde_json"]
+# A dcgi is a short-lived per-request process, so the Web API client uses
+# BLOCKING ureq (no tokio) — decided with the maintainer. `net` gates only the
+# HTTP stack (ureq); serde is always on so the response structs and the render
+# functions compile offline for the test suite. `default = ["net"]` so the image
+# build (`cargo build --release`) gets the client with no Dockerfile change;
+# `cargo test --no-default-features` builds the pure offline core.
+[features]
+default = ["net"]
+net = ["dep:ureq"]
 
 [dependencies]
 # The shared gopher spine (menu model + .gph serializer). std-only, pinned by tag
 # so the image build resolves it with only this repo checked out.
 gopher-core = { git = "https://github.com/felipedbene/gopher-core", tag = "v0.2.0" }
+# Response models + JSON. Always on (small) so structs/render are testable offline.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Blocking HTTPS for the Spotify Web API + the OAuth token exchange. rustls-backed
+# (ring builds on both amd64 and arm64 — both little-endian, so no big-endian
+# caveat here). A per-request dcgi wants a blocking client with no async runtime.
+ureq = { version = "2", optional = true, default-features = false, features = ["tls", "json"] }
 
 [profile.release]
 opt-level = 3

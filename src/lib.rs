@@ -3,14 +3,19 @@
 //! Two shapes share one binary (see `main.rs`):
 //!   gopher-spot root
 //!       Print the static root menu as a geomyidae `.gph`. Baked to
-//!       `/srv/index.gph` at image build time (the root is a fixed list of
-//!       links; nothing dynamic lives there).
+//!       `/srv/index.gph` at image build time.
 //!   gopher-spot dcgi $search $arguments $host $port $traversal $selector
 //!       The dynamic entry geomyidae calls for any `/spot/*` selector (via the
 //!       `index.dcgi` fallback). Routes on the selector and prints a gophermap.
+//!   gopher-spot oauth-init                       (net feature)
+//!       One-shot Spotify Authorization Code flow that prints a refresh token.
 //!
-//! Fio B is the offline skeleton: the `/spot/*` endpoints render mock menus. The
-//! Web API wiring (search/control/now-playing) arrives in Fio C.
+//! The dcgi drives the Spotify Web API (blocking `ureq`) against the
+//! `gopher-spot` Connect device. Output is transcoded to MacRoman at the IO edge
+//! (`main.rs`) so TurboGopher on Mac OS 9 renders accented names cleanly.
 
+pub mod cache;
 pub mod dcgi;
+pub mod macroman;
 pub mod menu;
+pub mod spotify;
