@@ -11,7 +11,9 @@
 use gopher_core::{info, link, render_menu_index, Entry, ItemKind};
 
 use crate::menu::{self, clip};
-use crate::spotify::{Control, Playing, SearchResults, SpotifyApi, Track};
+use crate::spotify::{
+    Control, Playing, PlaylistsPage, SearchResults, SpotifyApi, Track, TracksPage, PAGE_SIZE,
+};
 
 /// The six arguments geomyidae hands a dcgi, in its documented order
 /// (`$search $arguments $host $port $traversal $selector`).
@@ -98,7 +100,10 @@ pub fn route(args: &DcgiArgs, api: Option<&dyn SpotifyApi>) -> String {
         p if p.starts_with("/spot/control/") => control(&p["/spot/control/".len()..], api),
         p if p.starts_with("/spot/track/") => track(&p["/spot/track/".len()..], api),
         "/spot/play" => play(args, api),
-        "/spot/playlists" => mock("Minhas playlists", "(mock) sem playlists ainda -- Fio D"),
+        "/spot/playlists" => playlists(args, api),
+        p if p.starts_with("/spot/playlists/") => {
+            playlist(&p["/spot/playlists/".len()..], args, api)
+        }
         p if p.starts_with("/spot/") => mock("Em construcao", &format!("rota {p} ainda nao implementada")),
         p => page(not_found_entries(p)),
     }
@@ -161,6 +166,29 @@ fn play(args: &DcgiArgs, api: Option<&dyn SpotifyApi>) -> String {
             Err(e) => page(error_entries(&e)),
         },
         None => mock("Tocar", &format!("(mock) tocaria {uri} -- Fio C")),
+    }
+}
+
+fn playlists(args: &DcgiArgs, api: Option<&dyn SpotifyApi>) -> String {
+    let offset = args.query("offset").and_then(|s| s.parse().ok()).unwrap_or(0);
+    match api {
+        Some(a) => match a.playlists(offset) {
+            Ok(p) => page(playlists_entries(&p)),
+            Err(e) => page(error_entries(&e)),
+        },
+        None => mock("Minhas playlists", "(mock) sem playlists -- configure o Secret OAuth"),
+    }
+}
+
+fn playlist(id: &str, args: &DcgiArgs, api: Option<&dyn SpotifyApi>) -> String {
+    let id = id.trim_end_matches('/');
+    let offset = args.query("offset").and_then(|s| s.parse().ok()).unwrap_or(0);
+    match api {
+        Some(a) => match a.playlist_tracks(id, offset) {
+            Ok(t) => page(playlist_tracks_entries(id, &t)),
+            Err(e) => page(error_entries(&e)),
+        },
+        None => mock("Playlist", &format!("(mock) faixas da playlist {id} -- Fio D")),
     }
 }
 
@@ -275,6 +303,58 @@ fn track_entries(t: &Track) -> Vec<Entry> {
     e
 }
 
+fn playlists_entries(p: &PlaylistsPage) -> Vec<Entry> {
+    let mut e = vec![info("Minhas playlists"), info("")];
+    if p.items.is_empty() {
+        e.push(info("Nenhuma playlist."));
+    } else {
+        for pl in &p.items {
+            if let Some(id) = &pl.id {
+                e.push(link(ItemKind::Menu, clip(&pl.name), format!("/spot/playlists/{id}")));
+            }
+        }
+    }
+    append_pager(&mut e, "/spot/playlists", p.offset, p.items.len(), p.total);
+    e.push(link(ItemKind::Menu, "Voltar ao menu", "/"));
+    e
+}
+
+fn playlist_tracks_entries(id: &str, t: &TracksPage) -> Vec<Entry> {
+    let mut e = vec![info("Faixas da playlist"), info("")];
+    if t.items.is_empty() {
+        e.push(info("Playlist vazia (ou fim da lista)."));
+    } else {
+        for track in &t.items {
+            if let Some(tid) = &track.id {
+                let disp = clip(&format!("{} - {}", track.name, track.artist_line()));
+                e.push(link(ItemKind::Menu, disp, format!("/spot/track/{tid}")));
+            }
+        }
+    }
+    append_pager(&mut e, &format!("/spot/playlists/{id}"), t.offset, t.items.len(), t.total);
+    e.push(link(ItemKind::Menu, "Voltar ao menu", "/"));
+    e
+}
+
+/// Append "Pagina anterior" / "Proxima pagina" links (20/page) when the offset
+/// window leaves items on either side. `base` is the selector to re-request with
+/// a new `?offset=`.
+fn append_pager(e: &mut Vec<Entry>, base: &str, offset: u32, shown: usize, total: u32) {
+    let has_prev = offset > 0;
+    let has_next = offset + (shown as u32) < total;
+    if has_prev || has_next {
+        e.push(info(""));
+    }
+    if has_prev {
+        let prev = offset.saturating_sub(PAGE_SIZE);
+        e.push(link(ItemKind::Menu, "<< Pagina anterior", format!("{base}?offset={prev}")));
+    }
+    if has_next {
+        let next = offset + PAGE_SIZE;
+        e.push(link(ItemKind::Menu, ">> Proxima pagina", format!("{base}?offset={next}")));
+    }
+}
+
 fn control_menu() -> Vec<Entry> {
     vec![
         info("Controles"),
@@ -364,7 +444,7 @@ fn urldecode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spotify::{Album, ApiError, Artist, Page};
+    use crate::spotify::{Album, ApiError, Artist, Page, Playlist};
 
     fn argv(search: &str, selector: &str) -> Vec<String> {
         let (_sel, arguments) = selector.split_once('?').unwrap_or((selector, ""));
@@ -417,6 +497,29 @@ mod tests {
         }
         fn control(&self, _cmd: Control) -> Result<(), ApiError> {
             Ok(())
+        }
+        fn playlists(&self, offset: u32) -> Result<PlaylistsPage, ApiError> {
+            // 25 playlists total, 20 per page: page 0 has 20, page 20 has 5.
+            let total = 25u32;
+            let n = (total.saturating_sub(offset)).min(20);
+            let items = (0..n)
+                .map(|i| Playlist {
+                    id: Some(format!("pl{}", offset + i)),
+                    name: format!("Playlist {}", offset + i),
+                })
+                .collect();
+            Ok(PlaylistsPage { items, total, offset })
+        }
+        fn playlist_tracks(&self, _id: &str, offset: u32) -> Result<TracksPage, ApiError> {
+            let items = vec![Track {
+                name: "Faixa X".into(),
+                artists: vec![Artist { name: "Chico".into() }],
+                album: Some(Album { name: "Al".into() }),
+                id: Some("tx".into()),
+                uri: "spotify:track:tx".into(),
+                duration_ms: 0,
+            }];
+            Ok(TracksPage { items, total: 1, offset })
         }
     }
 
@@ -503,6 +606,7 @@ mod tests {
         for sel in [
             "/spot", "/spot/now", "/spot/search", "/spot/control", "/spot/control/next",
             "/spot/track/abc", "/spot/play?uri=spotify:track:abc",
+            "/spot/playlists", "/spot/playlists?offset=20", "/spot/playlists/pl0",
         ] {
             let out = r("q", sel, Some(&f));
             assert!(!out.contains('\t'), "tabs in {sel}");
@@ -512,6 +616,27 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn playlists_list_links_and_pages() {
+        let f = fake();
+        let out = r("", "/spot/playlists", Some(&f));
+        assert!(out.contains("[1|Playlist 0|/spot/playlists/pl0|server|port]"));
+        // 25 total, page 0 -> next page link, no prev
+        assert!(out.contains("[1|>> Proxima pagina|/spot/playlists?offset=20|server|port]"));
+        assert!(!out.contains("Pagina anterior"));
+        // second page -> prev link, no next (5 left)
+        let out2 = r("", "/spot/playlists?offset=20", Some(&f));
+        assert!(out2.contains("[1|<< Pagina anterior|/spot/playlists?offset=0|server|port]"));
+        assert!(!out2.contains("Proxima pagina"));
+    }
+
+    #[test]
+    fn playlist_tracks_link_to_track_detail() {
+        let f = fake();
+        let out = r("", "/spot/playlists/pl0", Some(&f));
+        assert!(out.contains("[1|Faixa X - Chico|/spot/track/tx|server|port]"));
     }
 
     #[test]

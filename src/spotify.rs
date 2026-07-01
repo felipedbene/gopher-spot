@@ -96,6 +96,32 @@ pub struct Device {
     pub is_active: bool,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct Playlist {
+    pub id: Option<String>,
+    pub name: String,
+}
+
+/// How many items per page (PROMPT: 20/página).
+pub const PAGE_SIZE: u32 = 20;
+
+/// One page of playlists (`/v1/me/playlists`), with the offset that produced it
+/// and the grand total, so the renderer can draw prev/next links.
+#[derive(Debug, Clone)]
+pub struct PlaylistsPage {
+    pub items: Vec<Playlist>,
+    pub total: u32,
+    pub offset: u32,
+}
+
+/// One page of tracks (search-less: a playlist's tracks).
+#[derive(Debug, Clone)]
+pub struct TracksPage {
+    pub items: Vec<Track>,
+    pub total: u32,
+    pub offset: u32,
+}
+
 /// The API operations the dcgi needs. Implemented by the real [`Client`] and by
 /// test fakes.
 pub trait SpotifyApi {
@@ -105,6 +131,10 @@ pub trait SpotifyApi {
     /// Start playback of a URI on the `gopher-spot` device.
     fn play(&self, uri: &str) -> Result<(), ApiError>;
     fn control(&self, cmd: Control) -> Result<(), ApiError>;
+    /// The user's playlists, paginated (offset in items).
+    fn playlists(&self, offset: u32) -> Result<PlaylistsPage, ApiError>;
+    /// A playlist's tracks, paginated.
+    fn playlist_tracks(&self, id: &str, offset: u32) -> Result<TracksPage, ApiError>;
 }
 
 // ---- The real blocking client (net feature) --------------------------------
@@ -123,7 +153,29 @@ mod net {
     const DEVICE_NAME: &str = "gopher-spot";
     const SEARCH_TTL: i64 = 300; // 5 min
     const DEVICES_TTL: i64 = 30; // 30 s
+    const PLAYLISTS_TTL: i64 = 60; // 60 s
     const HTTP_TIMEOUT_SECS: u64 = 10;
+
+    #[derive(Deserialize)]
+    struct RawPlaylists {
+        #[serde(default = "Vec::new")]
+        items: Vec<Playlist>,
+        #[serde(default)]
+        total: u32,
+    }
+
+    #[derive(Deserialize)]
+    struct RawPlItem {
+        track: Option<Track>,
+    }
+
+    #[derive(Deserialize)]
+    struct RawPlTracks {
+        #[serde(default = "Vec::new")]
+        items: Vec<RawPlItem>,
+        #[serde(default)]
+        total: u32,
+    }
 
     /// A configured Web API client. Cheap to build per request (the dcgi is one
     /// process per request); the disk cache carries the token + results across
@@ -221,6 +273,17 @@ mod net {
             res.map(|_| ()).map_err(api_err)
         }
 
+        /// GET `path` with the disk cache in front (TTL seconds), returning the
+        /// raw JSON body.
+        fn get_cached(&self, key: &str, ttl: i64, path: &str) -> Result<String, ApiError> {
+            if let Some(c) = cache::get(&self.state_dir, key, self.now_unix) {
+                return Ok(c);
+            }
+            let s = self.get(path)?.into_string().map_err(|e| e.to_string())?;
+            cache::put(&self.state_dir, key, self.now_unix, ttl, &s);
+            Ok(s)
+        }
+
         /// The `gopher-spot` device id (cached 30s). Falls back to the active
         /// device, then the first one; errors if the account has no devices.
         fn device_id(&self) -> Result<String, ApiError> {
@@ -289,6 +352,27 @@ mod net {
                     self.command("PUT", &format!("/v1/me/player/volume?volume_percent={pct}"))
                 }
             }
+        }
+
+        fn playlists(&self, offset: u32) -> Result<PlaylistsPage, ApiError> {
+            let body = self.get_cached(
+                &format!("playlists:{offset}"),
+                PLAYLISTS_TTL,
+                &format!("/v1/me/playlists?limit={PAGE_SIZE}&offset={offset}"),
+            )?;
+            let raw: RawPlaylists = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+            Ok(PlaylistsPage { items: raw.items, total: raw.total, offset })
+        }
+
+        fn playlist_tracks(&self, id: &str, offset: u32) -> Result<TracksPage, ApiError> {
+            let body = self.get_cached(
+                &format!("pltracks:{id}:{offset}"),
+                PLAYLISTS_TTL,
+                &format!("/v1/playlists/{id}/tracks?limit={PAGE_SIZE}&offset={offset}"),
+            )?;
+            let raw: RawPlTracks = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+            let items = raw.items.into_iter().filter_map(|i| i.track).collect();
+            Ok(TracksPage { items, total: raw.total, offset })
         }
     }
 

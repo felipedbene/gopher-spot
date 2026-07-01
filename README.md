@@ -218,3 +218,17 @@ user-library-read`.
 **Validation** (needs audio-stream up so the `gopher-spot` device exists): from
 OS 9, Buscar → "chico buarque" → "Construção" → `>> Tocar agora`, hear it in
 Audion (parked on the audio LB bookmark).
+
+## Fio D — playlists + OS 9 validation
+
+`/spot/playlists` (the user's playlists, 20/page) and `/spot/playlists/{id}` (its
+tracks → `/spot/track/{id}` detail → play). Both cached 60s. Pagination is
+`?offset=N` with `<< Pagina anterior` / `>> Proxima pagina` links that appear only
+when the window leaves items on a side. The type-`s` `.pls` reopen item works
+(static file from `AUDIO_STREAM_URL`).
+
+Manual TurboGopher validation is a checklist in
+[`scripts/validate-turbogopher.md`](scripts/validate-turbogopher.md) — including a
+recipe to run a local server on the QEMU host's vmnet IP so the OS 9 guest can
+reach it without cluster routing. (The blog post is skipped for now, per the
+maintainer.)
