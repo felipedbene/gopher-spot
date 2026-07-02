@@ -132,6 +132,9 @@ pub struct TracksPage {
 /// test fakes.
 pub trait SpotifyApi {
     fn now_playing(&self) -> Result<Playing, ApiError>;
+    /// The upcoming queue (`/v1/me/player/queue`). Empty when nothing is queued —
+    /// which is what "no more tracks left in queue" looks like to the user.
+    fn queue(&self) -> Result<Vec<Track>, ApiError>;
     fn search(&self, query: &str) -> Result<SearchResults, ApiError>;
     fn track(&self, id: &str) -> Result<Track, ApiError>;
     /// Start playback of a URI on the `gopher-spot` device.
@@ -323,6 +326,20 @@ mod net {
                 return Ok(Playing { is_playing: false, progress_ms: 0, item: None, device: None });
             }
             resp.into_json().map_err(|e| format!("now-playing parse failed: {e}"))
+        }
+
+        fn queue(&self) -> Result<Vec<Track>, ApiError> {
+            let resp = self.get("/v1/me/player/queue")?;
+            if resp.status() == 204 {
+                return Ok(Vec::new());
+            }
+            #[derive(Deserialize)]
+            struct RawQueue {
+                #[serde(default = "Vec::new")]
+                queue: Vec<Track>,
+            }
+            let q: RawQueue = resp.into_json().map_err(|e| format!("queue parse failed: {e}"))?;
+            Ok(q.queue)
         }
 
         fn search(&self, query: &str) -> Result<SearchResults, ApiError> {

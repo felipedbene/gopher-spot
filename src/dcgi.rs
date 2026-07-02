@@ -90,7 +90,11 @@ pub fn route(args: &DcgiArgs, api: Option<&dyn SpotifyApi>) -> String {
         "" | "/" | "/spot" => menu::root_gph(),
         "/spot/now" => match api {
             Some(a) => match a.now_playing() {
-                Ok(p) => page(now_entries(&p)),
+                // Queue is best-effort context, never block Now Playing on it.
+                Ok(p) => {
+                    let next = a.queue().ok().and_then(|q| q.into_iter().next());
+                    page(now_entries(&p, next.as_ref()))
+                }
                 Err(e) => page(error_entries(&e)),
             },
             None => mock("Now Playing", "(mock) nada tocando -- configure o Secret OAuth"),
@@ -233,7 +237,7 @@ fn control(sub: &str, api: Option<&dyn SpotifyApi>) -> String {
 
 // ---- entry builders --------------------------------------------------------
 
-fn now_entries(p: &Playing) -> Vec<Entry> {
+fn now_entries(p: &Playing, next: Option<&Track>) -> Vec<Entry> {
     let mut e = vec![info("Now Playing"), info("")];
     match &p.item {
         Some(t) => {
@@ -243,6 +247,13 @@ fn now_entries(p: &Playing) -> Vec<Entry> {
                 e.push(info(clip(&format!("album: {}", al.name))));
             }
             e.push(info(if p.is_playing { "[tocando]" } else { "[pausado]" }));
+            // Surface the queue so "no more tracks left in queue" isn't invisible.
+            // With autoplay on, an empty queue means the radio will pick the next
+            // song; say so instead of leaving the user guessing.
+            match next {
+                Some(n) => e.push(info(clip(&format!("proxima: {}", n.name)))),
+                None => e.push(info("fila vazia (radio automatico)")),
+            }
             // If the active device isn't gopher-spot, the audio stream (which only
             // carries librespot's output) is NOT what this menu shows — warn, so a
             // stale/other-device track doesn't look like what you hear.
@@ -272,6 +283,8 @@ fn now_entries(p: &Playing) -> Vec<Entry> {
             e.push(info("Transfira o playback pro device gopher-spot."));
         }
     }
+    e.push(info(""));
+    e.push(link(ItemKind::Search, "Buscar", "/spot/search"));
     e.push(link(ItemKind::Menu, "Voltar ao menu", "/"));
     e
 }
@@ -510,6 +523,9 @@ mod tests {
         fn now_playing(&self) -> Result<Playing, ApiError> {
             Ok(self.playing.clone())
         }
+        fn queue(&self) -> Result<Vec<Track>, ApiError> {
+            Ok(Vec::new())
+        }
         fn search(&self, q: &str) -> Result<SearchResults, ApiError> {
             Ok(SearchResults {
                 tracks: Some(Page {
@@ -596,6 +612,10 @@ mod tests {
         assert!(out.contains("Construção"));
         assert!(out.contains("Chico Buarque"));
         assert!(out.contains("[tocando]"));
+        // Inline controls + queue state + a Buscar shortcut all live here now.
+        assert!(out.contains("/spot/control/next"));
+        assert!(out.contains("fila vazia")); // Fake queue is empty
+        assert!(out.contains("[7|Buscar|/spot/search|server|port]"));
     }
 
     #[test]
