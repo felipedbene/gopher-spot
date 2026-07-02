@@ -7,7 +7,8 @@
 //!       One-shot Spotify Authorization Code flow; prints REFRESH_TOKEN=... .
 //!
 //! All gophermap output is transcoded to MacRoman on the way to stdout so
-//! TurboGopher renders accented track names cleanly (ASCII is identity).
+//! the OS 9 gopher client (Netscape Communicator, or TurboGopher) renders accented
+//! track names cleanly (ASCII is identity).
 
 use std::io::Write;
 use std::process::ExitCode;

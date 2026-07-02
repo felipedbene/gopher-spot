@@ -158,7 +158,7 @@ fn play(args: &DcgiArgs, api: Option<&dyn SpotifyApi>) -> String {
                 info("Mandando tocar no gopher-spot..."),
                 info(clip(&uri)),
                 info(""),
-                info("(abra o Audion no bookmark do stream de audio)"),
+                info("(abra o MacAST no bookmark do stream de audio)"),
                 info(""),
                 link(ItemKind::Menu, "Now Playing", "/spot/now"),
                 link(ItemKind::Menu, "Voltar ao menu", "/"),

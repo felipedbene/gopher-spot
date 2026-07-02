@@ -3,8 +3,8 @@
 //! are assembled in `dcgi.rs`.
 //!
 //! Width + charset: display strings stay <= 66 columns (RFC 1436) and ASCII, so
-//! the bytes are identical in UTF-8 and MacRoman and TurboGopher renders them
-//! clean. When Fio C starts echoing Spotify track/artist names (which carry
+//! the bytes are identical in UTF-8 and MacRoman and the OS 9 gopher client renders
+//! them clean. When Fio C starts echoing Spotify track/artist names (which carry
 //! accents and non-Latin scripts), those dynamic strings will need a UTF-8 ->
 //! MacRoman transcode at the IO edge — flagged there, not needed yet.
 
@@ -46,7 +46,7 @@ pub fn root_entries() -> Vec<Entry> {
 /// dcgi `/spot` route, so there is one source of truth.
 pub fn root_gph() -> String {
     let mut out = render_menu_index(&root_entries());
-    out.push_str(&sound_line("Reabrir stream (Audion)", "/spot/stream.pls"));
+    out.push_str(&sound_line("Reabrir stream (MacAST)", "/spot/stream.pls"));
     out
 }
 
@@ -93,6 +93,6 @@ mod tests {
         assert!(gph.contains("[7|Buscar|/spot/search|server|port]"));
         assert!(gph.contains("[1|Minhas playlists|/spot/playlists|server|port]"));
         assert!(gph.contains("[1|Controles|/spot/control|server|port]"));
-        assert!(gph.contains("[s|Reabrir stream (Audion)|/spot/stream.pls|server|port]"));
+        assert!(gph.contains("[s|Reabrir stream (MacAST)|/spot/stream.pls|server|port]"));
     }
 }

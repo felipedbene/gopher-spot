@@ -1,7 +1,8 @@
 //! UTF-8 -> MacRoman transcoding for the wire.
 //!
-//! TurboGopher on Mac OS 9 decodes bytes as MacRoman, so once we echo Spotify
-//! track/artist names (accents, smart quotes, non-Latin scripts) the gophermap
+//! The OS 9 gopher client (Netscape Communicator, or TurboGopher) decodes bytes as
+//! MacRoman, so once we echo Spotify track/artist names (accents, smart quotes,
+//! non-Latin scripts) the gophermap
 //! bytes must be MacRoman, not UTF-8. The whole rendered `.gph` is passed through
 //! [`encode`] at the IO edge: ASCII (< 0x80) — including every structural byte
 //! `[ ] | \t \n` geomyidae parses — is identity, and only the accented display

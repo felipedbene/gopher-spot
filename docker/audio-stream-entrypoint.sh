@@ -2,7 +2,7 @@
 # audio-stream: an Icecast radio fed by librespot.
 #
 # Why Icecast and not a bare `ffmpeg -listen 1`: the listener socket must be
-# ALWAYS up (Audion parks on it), serve MANY clients, and survive idle/pauses/
+# ALWAYS up (MacAST parks on it), serve MANY clients, and survive idle/pauses/
 # track changes. `-listen 1` did none of that — it only served one client, only
 # while a track was actively producing PCM, and dropped on every gap ("connection
 # refused"). Icecast is a persistent streaming server: clients connect once and

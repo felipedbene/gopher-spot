@@ -12,7 +12,8 @@
 //!
 //! The dcgi drives the Spotify Web API (blocking `ureq`) against the
 //! `gopher-spot` Connect device. Output is transcoded to MacRoman at the IO edge
-//! (`main.rs`) so TurboGopher on Mac OS 9 renders accented names cleanly.
+//! (`main.rs`) so the OS 9 gopher client (Netscape Communicator, or TurboGopher)
+//! renders accented names cleanly.
 
 pub mod cache;
 pub mod dcgi;

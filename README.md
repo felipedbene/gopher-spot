@@ -3,11 +3,12 @@
 **Spotify Connect, controlled from Mac OS 9 over the Gopher protocol (RFC 1436,
 1991). Runs 100% on a homelab Kubernetes cluster. LAN-only.**
 
-You search, browse playlists, and drive playback from **TurboGopher** (or
-Netscape's gopher client) on a 1999 Mac — inside a UTM/QEMU VM, or on real
-hardware — and the music comes out of **Audion 3** parked on an MP3 stream. No
-Spotify app, no browser, no JavaScript, no TLS. A protocol older than the Web
-carries a 2020s streaming service to an OS that shipped on beige plastic.
+You search, browse playlists, and drive playback from **Netscape Communicator's
+built-in Gopher browser** (TurboGopher works too) on a 1999 Mac — inside a
+UTM/QEMU VM, or on real hardware — and the music comes out of **MacAST**, a
+classic MP3 player parked on the stream. No Spotify app, no modern web, no
+JavaScript, no TLS: a 1997 browser speaks a 1991 protocol to reach a 2020s
+streaming service, on an OS that shipped on beige plastic.
 
 It works. That is the whole point. See [PROMPT.md](PROMPT.md) for the original
 design brief and [the build story](#build-story) for what it cost.
@@ -32,17 +33,17 @@ design brief and [the build story](#build-story) for what it cost.
 ## The idea in one diagram
 
 The trick is a **split between the control plane and the data plane**. Gopher was
-never going to carry a 128 kbps MP3 to a G3 — so it doesn't. TurboGopher only ever
-sends and receives tiny text menus; the audio travels on a completely separate
-HTTP stream that a dedicated MP3 player (Audion) holds open. Two MetalLB
+never going to carry a 128 kbps MP3 to a G3 — so it doesn't. The Gopher client only
+ever sends and receives tiny text menus; the audio travels on a completely separate
+HTTP stream that a dedicated MP3 player (MacAST) holds open. Two MetalLB
 LoadBalancer IPs, two jobs.
 
 ```mermaid
 flowchart TB
     subgraph os9["🖥️  Mac OS 9  (UTM / QEMU guest, or real hardware)"]
         direction LR
-        TG["TurboGopher<br/><i>control plane</i><br/>gopher :70"]
-        AU["Audion 3<br/><i>data plane</i><br/>HTTP MP3 :8000"]
+        TG["Netscape Communicator<br/>(gopher client)<br/><i>control plane</i> · :70"]
+        AU["MacAST<br/><i>data plane</i><br/>HTTP MP3 :8000"]
     end
 
     subgraph k8s["☸  debene homelab cluster  (vanilla kubeadm, mixed amd64/arm64)"]
@@ -76,8 +77,8 @@ flowchart TB
 
 Key consequences of the split:
 
-- **OS 9 never touches the MP3 through Gopher.** TurboGopher issues a `PUT play`
-  via the dcgi; the audio is already flowing to Audion on the other socket.
+- **OS 9 never touches the MP3 through Gopher.** Netscape issues a `PUT play`
+  via the dcgi; the audio is already flowing to MacAST on the other socket.
 - **The dcgi has no idea what audio sounds like.** It's a stateless text
   transformer: selector in, gophermap out.
 - **librespot never opens a port for OS 9.** It's an *outbound* Spotify Connect
@@ -95,20 +96,20 @@ gopher menu on a 25-year-old Mac and, a beat later, it's playing.
 sequenceDiagram
     autonumber
     actor U as You (OS 9)
-    participant TG as TurboGopher
+    participant TG as Netscape (gopher)
     participant GEO as geomyidae :70
     participant D as gopher-spot dcgi
     participant API as Spotify Web API
     participant LS as librespot (device)
     participant IC as Icecast :8000
-    participant AU as Audion 3
+    participant AU as MacAST
 
-    Note over AU,IC: Audion has been parked on :8000/spotify.mp3 since boot,<br/>hearing silence while nothing plays.
+    Note over AU,IC: MacAST has been parked on :8000/spotify.mp3 since boot,<br/>hearing silence while nothing plays.
 
     U->>TG: select "Buscar" (type-7), type "chico buarque"
     TG->>GEO: gopher request  /spot/search  + query
     GEO->>D: exec index.dcgi $search … $selector
-    D->>API: GET /v1/search?type=track&limit=10  (blocking ureq)
+    D->>API: GET /v1/search?type=track,album,artist&limit=10  (blocking ureq)
     API-->>D: JSON results
     D-->>GEO: gophermap: track list as /spot/track/{id} links (MacRoman)
     GEO-->>TG: menu
@@ -123,7 +124,7 @@ sequenceDiagram
     LS->>IC: PCM → ffmpeg → MP3 source on /spotify.mp3
     IC-->>AU: live audio overrides the silence fallback
     D-->>TG: "Mandando tocar…" confirmation menu
-    Note over AU: 🎵 you hear "Construção"
+    Note over AU: 🎵 you hear it in MacAST
 ```
 
 The dcgi is exec'd **fresh for every one of those arrows** — geomyidae spawns a
@@ -252,7 +253,7 @@ classDiagram
 | `dcgi.rs`       | Parse geomyidae's 6 args; route a selector to a gophermap. Pure, fake-testable.  |
 | `spotify.rs`    | `SpotifyApi` trait + response models + the real blocking `ureq` `Client`.        |
 | `cache.rs`      | File-backed TTL cache (token, search 5 min, devices 30 s, playlists 60 s).       |
-| `macroman.rs`   | UTF-8 → Mac OS Roman transcode so TurboGopher renders accents correctly.         |
+| `macroman.rs`   | UTF-8 → Mac OS Roman transcode so the OS 9 gopher client renders accents right.  |
 | `menu.rs`       | The static root menu, the RFC-1436 66-column clip, the type-`s` `.pls` line.     |
 
 **28 unit tests**, all offline (`cargo test --no-default-features` builds the pure
@@ -302,7 +303,7 @@ a `.pls` must be served raw, not interpreted as a menu.
 The audio-stream container runs **Icecast**, a persistent streaming server, fed by
 `librespot | ffmpeg`. An earlier `ffmpeg -listen 1` design served exactly one
 client, only while a track was actively producing PCM, and dropped on every
-pause/track-gap — so Audion got "connection refused" most of the time. Icecast
+pause/track-gap — so MacAST got "connection refused" most of the time. Icecast
 fixes all three failure modes with a **silence fallback mount**:
 
 ```mermaid
@@ -312,7 +313,7 @@ flowchart LR
         LIVE["librespot | ffmpeg<br/>(only while playing)"] -->|source| M1["/spotify.mp3"]
     end
     M1 -. "fallback-mount + fallback-override<br/>(when live source times out)" .-> M2
-    M1 ==>|listeners| AU["Audion :8000/spotify.mp3"]
+    M1 ==>|listeners| AU["MacAST :8000/spotify.mp3"]
     M2 -. fills the gaps .-> AU
 
     style M1 fill:#1a5c3a,stroke:#4fd18b,color:#fff
@@ -425,7 +426,7 @@ kubectl rollout restart deployment/gopher-server -n gopher-spot
 Without the `spotify-oauth` Secret, the server still starts and serves the mock
 menus (`optional: true` on the `secretRef`). Local smoke tests and the manual
 OS 9 validation checklist live in
-[`scripts/validate-turbogopher.md`](scripts/validate-turbogopher.md) — including a
+[`scripts/validate-os9.md`](scripts/validate-os9.md) — including a
 recipe to run a local server on the QEMU host's vmnet IP so the OS 9 guest reaches
 it without cluster routing.
 
@@ -457,7 +458,7 @@ gantt
   the Web API, playlists, MacRoman, 28 tests — went from nothing to committed. The
   four "fios" (A→D) map one-to-one onto commits. Fast because the shape was clear.
 - **Session 2 (Jul 1, ~6.5 h):** the *hard* part, and only 2 commits to show for
-  it. Audio was "ta quebrado" — control worked, but Audion got connection-refused.
+  it. Audio was "ta quebrado" — control worked, but MacAST got connection-refused.
   Two separate root causes, each a rabbit hole: (1) **librespot 0.6.0 was silently
   dead** post a Spotify server change — hours ruled out plumbing before pinning the
   dev branch; (2) `ffmpeg -listen 1` was **too fragile to keep a stream up**,
@@ -498,7 +499,7 @@ gopher-spot/
 └── scripts/
     ├── buildx.sh                     # multi-arch build + push
     ├── spotify-oauth-init.sh         # one-shot OAuth → deploy/secrets.yaml
-    └── validate-turbogopher.md       # manual OS 9 validation checklist
+    └── validate-os9.md               # manual OS 9 validation checklist
 ```
 
 ### Non-goals
