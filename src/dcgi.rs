@@ -12,7 +12,8 @@ use gopher_core::{info, link, render_menu_index, Entry, ItemKind};
 
 use crate::menu::{self, clip};
 use crate::spotify::{
-    Control, Playing, PlaylistsPage, SearchResults, SpotifyApi, Track, TracksPage, PAGE_SIZE,
+    id_from_uri, AlbumDetail, AlbumsPage, Artist, Control, Playing, PlaylistsPage, SearchResults,
+    SpotifyApi, Track, TracksPage, PAGE_SIZE,
 };
 
 /// The six arguments geomyidae hands a dcgi, in its documented order
@@ -103,6 +104,14 @@ pub fn route(args: &DcgiArgs, api: Option<&dyn SpotifyApi>) -> String {
         "/spot/control" => page(control_menu()),
         p if p.starts_with("/spot/control/") => control(&p["/spot/control/".len()..], api),
         p if p.starts_with("/spot/track/") => track(&p["/spot/track/".len()..], api),
+        p if p.starts_with("/spot/album/") => album(&p["/spot/album/".len()..], args, api),
+        p if p.starts_with("/spot/artist/") => {
+            let rest = &p["/spot/artist/".len()..];
+            match rest.strip_suffix("/albums") {
+                Some(id) => artist_albums(id, args, api),
+                None => artist(rest, args, api),
+            }
+        }
         "/spot/play" => play(args, api),
         "/spot/playlists" => playlists(args, api),
         p if p.starts_with("/spot/playlists/") => {
@@ -148,6 +157,43 @@ fn track(id: &str, api: Option<&dyn SpotifyApi>) -> String {
             Err(e) => page(error_entries(&e)),
         },
         None => mock("Faixa", &format!("(mock) detalhe da faixa {id} -- Fio C")),
+    }
+}
+
+fn album(id: &str, args: &DcgiArgs, api: Option<&dyn SpotifyApi>) -> String {
+    let id = id.trim_end_matches('/');
+    let offset = args.query("offset").and_then(|s| s.parse().ok()).unwrap_or(0);
+    match api {
+        // Header + track page: two cached GETs (header is near-free after warm-up),
+        // which also paginates albums with >50 tracks correctly.
+        Some(a) => match (a.album(id), a.album_tracks(id, offset)) {
+            (Ok(al), Ok(t)) => page(album_entries(id, &al, &t)),
+            (Err(e), _) | (_, Err(e)) => page(error_entries(&e)),
+        },
+        None => mock("Album", &format!("(mock) album {id} -- Fio C")),
+    }
+}
+
+fn artist(id: &str, _args: &DcgiArgs, api: Option<&dyn SpotifyApi>) -> String {
+    let id = id.trim_end_matches('/');
+    match api {
+        Some(a) => match (a.artist(id), a.artist_top_tracks(id)) {
+            (Ok(ar), Ok(top)) => page(artist_entries(id, &ar, &top)),
+            (Err(e), _) | (_, Err(e)) => page(error_entries(&e)),
+        },
+        None => mock("Artista", &format!("(mock) artista {id} -- Fio C")),
+    }
+}
+
+fn artist_albums(id: &str, args: &DcgiArgs, api: Option<&dyn SpotifyApi>) -> String {
+    let id = id.trim_end_matches('/');
+    let offset = args.query("offset").and_then(|s| s.parse().ok()).unwrap_or(0);
+    match api {
+        Some(a) => match a.artist_albums(id, offset) {
+            Ok(p) => page(artist_albums_entries(id, &p)),
+            Err(e) => page(error_entries(&e)),
+        },
+        None => mock("Discografia", &format!("(mock) albuns do artista {id}")),
     }
 }
 
@@ -242,16 +288,24 @@ fn now_entries(p: &Playing, next: Option<&Track>) -> Vec<Entry> {
     match &p.item {
         Some(t) => {
             e.push(info(clip(&t.name)));
-            e.push(info(clip(&format!("por {}", t.artist_line()))));
-            if let Some(al) = &t.album {
-                e.push(info(clip(&format!("album: {}", al.name))));
-            }
+            // Artist(s) and album are now clickable — jump straight to their pages
+            // instead of bouncing back to search.
+            push_artist_links(&mut e, &t.artists, &t.artist_line());
+            push_album_link(&mut e, t.album.as_ref());
             e.push(info(if p.is_playing { "[tocando]" } else { "[pausado]" }));
             // Surface the queue so "no more tracks left in queue" isn't invisible.
             // With autoplay on, an empty queue means the radio will pick the next
-            // song; say so instead of leaving the user guessing.
+            // song; say so instead of leaving the user guessing. Link the next
+            // track to its detail page when we know its id.
             match next {
-                Some(n) => e.push(info(clip(&format!("proxima: {}", n.name)))),
+                Some(n) => match &n.id {
+                    Some(nid) => e.push(link(
+                        ItemKind::Menu,
+                        clip(&format!("proxima: {}", n.name)),
+                        format!("/spot/track/{nid}"),
+                    )),
+                    None => e.push(info(clip(&format!("proxima: {}", n.name)))),
+                },
                 None => e.push(info("fila vazia (radio automatico)")),
             }
             // If the active device isn't gopher-spot, the audio stream (which only
@@ -283,9 +337,7 @@ fn now_entries(p: &Playing, next: Option<&Track>) -> Vec<Entry> {
             e.push(info("Transfira o playback pro device gopher-spot."));
         }
     }
-    e.push(info(""));
-    e.push(link(ItemKind::Search, "Buscar", "/spot/search"));
-    e.push(link(ItemKind::Menu, "Voltar ao menu", "/"));
+    hub_footer(&mut e);
     e
 }
 
@@ -303,18 +355,18 @@ fn search_entries(query: &str, r: &SearchResults) -> Vec<Entry> {
             }
         }
     }
-    // Artists / albums are playable as a CONTEXT (multiple songs): selecting an
-    // artist plays its top tracks, an album plays the whole thing. play() routes
-    // a non-track URI through context_uri. Fall back to a plain line if the API
-    // omitted the uri.
+    // Artists / albums open their DETAIL page (which leads with a "Tocar tudo"),
+    // so search is a real entry point into the browsable graph rather than a
+    // play-and-done. Fall back to a plain line if the API omitted the uri.
     if let Some(artists) = r.artists.as_ref().filter(|p| !p.items.is_empty()) {
         e.push(info(""));
         e.push(info("Artistas:"));
         for a in artists.items.iter().take(5) {
-            if a.uri.is_empty() {
-                e.push(info(clip(&format!("  {}", a.name))));
-            } else {
-                e.push(link(ItemKind::Menu, clip(&a.name), format!("/spot/play?uri={}", a.uri)));
+            match id_from_uri(&a.uri) {
+                Some(aid) => {
+                    e.push(link(ItemKind::Menu, clip(&a.name), format!("/spot/artist/{aid}")))
+                }
+                None => e.push(info(clip(&format!("  {}", a.name)))),
             }
         }
     }
@@ -322,27 +374,24 @@ fn search_entries(query: &str, r: &SearchResults) -> Vec<Entry> {
         e.push(info(""));
         e.push(info("Albuns:"));
         for a in albums.items.iter().take(5) {
-            if a.uri.is_empty() {
-                e.push(info(clip(&format!("  {}", a.name))));
-            } else {
-                e.push(link(ItemKind::Menu, clip(&a.name), format!("/spot/play?uri={}", a.uri)));
+            match id_from_uri(&a.uri) {
+                Some(aid) => {
+                    e.push(link(ItemKind::Menu, clip(&a.name), format!("/spot/album/{aid}")))
+                }
+                None => e.push(info(clip(&format!("  {}", a.name)))),
             }
         }
     }
     e.push(info(""));
     e.push(link(ItemKind::Search, "Buscar de novo", "/spot/search"));
-    e.push(link(ItemKind::Menu, "Voltar ao menu", "/"));
+    hub_footer(&mut e);
     e
 }
 
 fn track_entries(t: &Track) -> Vec<Entry> {
-    let mut e = vec![
-        info(clip(&t.name)),
-        info(clip(&format!("por {}", t.artist_line()))),
-    ];
-    if let Some(al) = &t.album {
-        e.push(info(clip(&format!("album: {}", al.name))));
-    }
+    let mut e = vec![info(clip(&t.name))];
+    push_artist_links(&mut e, &t.artists, &t.artist_line());
+    push_album_link(&mut e, t.album.as_ref());
     if t.duration_ms > 0 {
         let secs = t.duration_ms / 1000;
         e.push(info(format!("duracao: {}:{:02}", secs / 60, secs % 60)));
@@ -353,8 +402,107 @@ fn track_entries(t: &Track) -> Vec<Entry> {
         e.push(link(ItemKind::Menu, ">> Tocar agora", format!("/spot/play?uri={}", t.uri)));
     }
     e.push(link(ItemKind::Menu, "Controles", "/spot/control"));
-    e.push(link(ItemKind::Menu, "Voltar ao menu", "/"));
+    hub_footer(&mut e);
     e
+}
+
+/// Floodgap-style navigation hub appended to every page so the user is never a
+/// dead end: Now Playing / Buscar / Menu, led by a blank spacer.
+fn hub_footer(e: &mut Vec<Entry>) {
+    e.push(info(""));
+    e.push(link(ItemKind::Menu, "Now Playing", "/spot/now"));
+    e.push(link(ItemKind::Search, "Buscar", "/spot/search"));
+    e.push(link(ItemKind::Menu, "Voltar ao menu", "/"));
+}
+
+/// One clickable "por <artist>" line per artist that carries a uri; if NONE do,
+/// fall back to the joined plain line so we never regress to a broken link.
+fn push_artist_links(e: &mut Vec<Entry>, artists: &[Artist], joined: &str) {
+    let any = artists.iter().any(|a| id_from_uri(&a.uri).is_some());
+    if !any {
+        e.push(info(clip(&format!("por {joined}"))));
+        return;
+    }
+    for ar in artists {
+        match id_from_uri(&ar.uri) {
+            Some(aid) => e.push(link(
+                ItemKind::Menu,
+                clip(&format!("por {}", ar.name)),
+                format!("/spot/artist/{aid}"),
+            )),
+            None => e.push(info(clip(&format!("por {}", ar.name)))),
+        }
+    }
+}
+
+/// A clickable "album: <name>" line, or plain info if the album has no uri.
+fn push_album_link(e: &mut Vec<Entry>, album: Option<&crate::spotify::Album>) {
+    if let Some(al) = album {
+        match id_from_uri(&al.uri) {
+            Some(aid) => e.push(link(
+                ItemKind::Menu,
+                clip(&format!("album: {}", al.name)),
+                format!("/spot/album/{aid}"),
+            )),
+            None => e.push(info(clip(&format!("album: {}", al.name)))),
+        }
+    }
+}
+
+fn album_entries(id: &str, a: &AlbumDetail, t: &TracksPage) -> Vec<Entry> {
+    let mut e = vec![info(clip(&a.name)), info("")];
+    push_artist_links(&mut e, &a.artists, &artists_joined(&a.artists));
+    if !a.uri.is_empty() {
+        e.push(link(ItemKind::Menu, ">> Tocar album", format!("/spot/play?uri={}", a.uri)));
+    }
+    e.push(info(""));
+    e.push(info("Faixas:"));
+    for tr in &t.items {
+        if let Some(tid) = &tr.id {
+            e.push(link(ItemKind::Menu, clip(&tr.name), format!("/spot/track/{tid}")));
+        }
+    }
+    append_pager(&mut e, &format!("/spot/album/{id}"), t.offset, t.items.len(), t.total);
+    hub_footer(&mut e);
+    e
+}
+
+fn artist_entries(id: &str, a: &Artist, top: &[Track]) -> Vec<Entry> {
+    let mut e = vec![info(clip(&a.name)), info("")];
+    if !a.uri.is_empty() {
+        e.push(link(ItemKind::Menu, ">> Tocar artista", format!("/spot/play?uri={}", a.uri)));
+    }
+    e.push(link(ItemKind::Menu, "Ver discografia", format!("/spot/artist/{id}/albums")));
+    e.push(info(""));
+    e.push(info("Populares:"));
+    for tr in top.iter().take(10) {
+        if let Some(tid) = &tr.id {
+            e.push(link(ItemKind::Menu, clip(&tr.name), format!("/spot/track/{tid}")));
+        }
+    }
+    hub_footer(&mut e);
+    e
+}
+
+fn artist_albums_entries(id: &str, p: &AlbumsPage) -> Vec<Entry> {
+    let mut e = vec![info("Discografia"), info("")];
+    if p.items.is_empty() {
+        e.push(info("Nenhum album."));
+    }
+    for al in &p.items {
+        match id_from_uri(&al.uri) {
+            Some(aid) => e.push(link(ItemKind::Menu, clip(&al.name), format!("/spot/album/{aid}"))),
+            None => e.push(info(clip(&format!("  {}", al.name)))),
+        }
+    }
+    append_pager(&mut e, &format!("/spot/artist/{id}/albums"), p.offset, p.items.len(), p.total);
+    hub_footer(&mut e);
+    e
+}
+
+/// Join artist names with ", " (Album/Artist have no `artist_line`).
+fn artists_joined(artists: &[Artist]) -> String {
+    artists.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ")
 }
 
 fn playlists_entries(p: &PlaylistsPage) -> Vec<Entry> {
@@ -369,7 +517,7 @@ fn playlists_entries(p: &PlaylistsPage) -> Vec<Entry> {
         }
     }
     append_pager(&mut e, "/spot/playlists", p.offset, p.items.len(), p.total);
-    e.push(link(ItemKind::Menu, "Voltar ao menu", "/"));
+    hub_footer(&mut e);
     e
 }
 
@@ -386,7 +534,7 @@ fn playlist_tracks_entries(id: &str, t: &TracksPage) -> Vec<Entry> {
         }
     }
     append_pager(&mut e, &format!("/spot/playlists/{id}"), t.offset, t.items.len(), t.total);
-    e.push(link(ItemKind::Menu, "Voltar ao menu", "/"));
+    hub_footer(&mut e);
     e
 }
 
@@ -556,8 +704,8 @@ mod tests {
         fn track(&self, id: &str) -> Result<Track, ApiError> {
             Ok(Track {
                 name: format!("Track {id}"),
-                artists: vec![Artist { name: "Chico".into(), uri: String::new() }],
-                album: Some(Album { name: "Al".into(), uri: String::new() }),
+                artists: vec![Artist { name: "Chico".into(), uri: "spotify:artist:ar1".into() }],
+                album: Some(Album { name: "Al".into(), uri: "spotify:album:al1".into() }),
                 id: Some(id.into()),
                 uri: format!("spotify:track:{id}"),
                 duration_ms: 380000,
@@ -592,6 +740,42 @@ mod tests {
             }];
             Ok(TracksPage { items, total: 1, offset })
         }
+        fn album(&self, id: &str) -> Result<AlbumDetail, ApiError> {
+            Ok(AlbumDetail {
+                name: format!("Album {id}"),
+                uri: format!("spotify:album:{id}"),
+                artists: vec![Artist { name: "Chico".into(), uri: "spotify:artist:ar1".into() }],
+                total: 1,
+            })
+        }
+        fn album_tracks(&self, _id: &str, offset: u32) -> Result<TracksPage, ApiError> {
+            let items = vec![Track {
+                name: "Faixa A".into(),
+                artists: vec![],
+                album: None,
+                id: Some("ta".into()),
+                uri: "spotify:track:ta".into(),
+                duration_ms: 0,
+            }];
+            Ok(TracksPage { items, total: 1, offset })
+        }
+        fn artist(&self, id: &str) -> Result<Artist, ApiError> {
+            Ok(Artist { name: format!("Artist {id}"), uri: format!("spotify:artist:{id}") })
+        }
+        fn artist_albums(&self, _id: &str, offset: u32) -> Result<AlbumsPage, ApiError> {
+            let items = vec![Album { name: "Disco".into(), uri: "spotify:album:d1".into() }];
+            Ok(AlbumsPage { items, total: 1, offset })
+        }
+        fn artist_top_tracks(&self, _id: &str) -> Result<Vec<Track>, ApiError> {
+            Ok(vec![Track {
+                name: "Top1".into(),
+                artists: vec![],
+                album: None,
+                id: Some("tt".into()),
+                uri: "spotify:track:tt".into(),
+                duration_ms: 0,
+            }])
+        }
     }
 
     fn fake() -> Fake {
@@ -601,8 +785,11 @@ mod tests {
                 progress_ms: 1000,
                 item: Some(Track {
                     name: "Construção".into(),
-                    artists: vec![Artist { name: "Chico Buarque".into(), uri: String::new() }],
-                    album: Some(Album { name: "Construção".into(), uri: String::new() }),
+                    artists: vec![Artist {
+                        name: "Chico Buarque".into(),
+                        uri: "spotify:artist:ar1".into(),
+                    }],
+                    album: Some(Album { name: "Construção".into(), uri: "spotify:album:al1".into() }),
                     id: Some("abc".into()),
                     uri: "spotify:track:abc".into(),
                     duration_ms: 380000,
@@ -644,7 +831,7 @@ mod tests {
     }
 
     #[test]
-    fn search_albums_and_artists_are_playable_contexts() {
+    fn search_albums_and_artists_link_to_detail() {
         let r = SearchResults {
             tracks: None,
             artists: Some(Page {
@@ -655,9 +842,50 @@ mod tests {
             }),
         };
         let out = render_menu_index(&search_entries("smiths", &r));
-        // Both link to /spot/play with their context URI (album/artist, not track).
-        assert!(out.contains("[1|The Smiths|/spot/play?uri=spotify:artist:sm|server|port]"));
-        assert!(out.contains("[1|The Queen Is Dead|/spot/play?uri=spotify:album:qd|server|port]"));
+        // Both open their detail page (browsable), not a direct play.
+        assert!(out.contains("[1|The Smiths|/spot/artist/sm|server|port]"));
+        assert!(out.contains("[1|The Queen Is Dead|/spot/album/qd|server|port]"));
+    }
+
+    #[test]
+    fn now_playing_links_album_and_artist() {
+        let f = fake();
+        let out = r("", "/spot/now", Some(&f));
+        assert!(out.contains("[1|por Chico Buarque|/spot/artist/ar1|server|port]"));
+        assert!(out.contains("[1|album: Construção|/spot/album/al1|server|port]"));
+    }
+
+    #[test]
+    fn track_detail_cross_links_album_and_artist() {
+        let f = fake();
+        let out = r("", "/spot/track/xyz", Some(&f));
+        assert!(out.contains("[1|por Chico|/spot/artist/ar1|server|port]"));
+        assert!(out.contains("[1|album: Al|/spot/album/al1|server|port]"));
+    }
+
+    #[test]
+    fn album_page_links_tracks_artist_and_play() {
+        let f = fake();
+        let out = r("", "/spot/album/qd", Some(&f));
+        assert!(out.contains("[1|por Chico|/spot/artist/ar1|server|port]"));
+        assert!(out.contains("[1|>> Tocar album|/spot/play?uri=spotify:album:qd|server|port]"));
+        assert!(out.contains("[1|Faixa A|/spot/track/ta|server|port]"));
+    }
+
+    #[test]
+    fn artist_page_lists_top_tracks_and_discography() {
+        let f = fake();
+        let out = r("", "/spot/artist/sm", Some(&f));
+        assert!(out.contains("[1|>> Tocar artista|/spot/play?uri=spotify:artist:sm|server|port]"));
+        assert!(out.contains("[1|Ver discografia|/spot/artist/sm/albums|server|port]"));
+        assert!(out.contains("[1|Top1|/spot/track/tt|server|port]"));
+    }
+
+    #[test]
+    fn artist_albums_page_links_albums() {
+        let f = fake();
+        let out = r("", "/spot/artist/sm/albums", Some(&f));
+        assert!(out.contains("[1|Disco|/spot/album/d1|server|port]"));
     }
 
     #[test]
@@ -700,6 +928,7 @@ mod tests {
             "/spot", "/spot/now", "/spot/search", "/spot/control", "/spot/control/next",
             "/spot/track/abc", "/spot/play?uri=spotify:track:abc",
             "/spot/playlists", "/spot/playlists?offset=20", "/spot/playlists/pl0",
+            "/spot/album/qd", "/spot/artist/sm", "/spot/artist/sm/albums",
         ] {
             let out = r("q", sel, Some(&f));
             assert!(!out.contains('\t'), "tabs in {sel}");

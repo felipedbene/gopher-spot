@@ -135,6 +135,35 @@ pub struct TracksPage {
     pub offset: u32,
 }
 
+/// Album header for `/spot/album/{id}` (from `/v1/albums/{id}`). The track list
+/// is fetched/paged separately via `album_tracks`.
+#[derive(Debug, Clone)]
+pub struct AlbumDetail {
+    pub name: String,
+    pub uri: String,
+    pub artists: Vec<Artist>,
+    pub total: u32,
+}
+
+/// One page of albums (an artist's discography), mirroring [`PlaylistsPage`].
+#[derive(Debug, Clone)]
+pub struct AlbumsPage {
+    pub items: Vec<Album>,
+    pub total: u32,
+    pub offset: u32,
+}
+
+/// Extract the trailing id from a `spotify:kind:ID` uri. `None` for empty or
+/// malformed input (so callers fall back to a plain, non-clickable line).
+pub fn id_from_uri(uri: &str) -> Option<&str> {
+    let id = uri.rsplit(':').next()?;
+    if id.is_empty() || id == uri {
+        None
+    } else {
+        Some(id)
+    }
+}
+
 /// The API operations the dcgi needs. Implemented by the real [`Client`] and by
 /// test fakes.
 pub trait SpotifyApi {
@@ -151,6 +180,16 @@ pub trait SpotifyApi {
     fn playlists(&self, offset: u32) -> Result<PlaylistsPage, ApiError>;
     /// A playlist's tracks, paginated.
     fn playlist_tracks(&self, id: &str, offset: u32) -> Result<TracksPage, ApiError>;
+    /// Album header (title, artists, track count) for a detail page.
+    fn album(&self, id: &str) -> Result<AlbumDetail, ApiError>;
+    /// An album's tracks, paginated.
+    fn album_tracks(&self, id: &str, offset: u32) -> Result<TracksPage, ApiError>;
+    /// Artist header (name, uri).
+    fn artist(&self, id: &str) -> Result<Artist, ApiError>;
+    /// An artist's albums (discography), paginated.
+    fn artist_albums(&self, id: &str, offset: u32) -> Result<AlbumsPage, ApiError>;
+    /// An artist's top tracks (market inferred from the token).
+    fn artist_top_tracks(&self, id: &str) -> Result<Vec<Track>, ApiError>;
 }
 
 // ---- The real blocking client (net feature) --------------------------------
@@ -174,6 +213,7 @@ mod net {
     const SEARCH_LIMIT: u32 = 10;
     const DEVICES_TTL: i64 = 30; // 30 s
     const PLAYLISTS_TTL: i64 = 60; // 60 s
+    const CATALOG_TTL: i64 = 86_400; // 24h — albums/artists are effectively static
     const HTTP_TIMEOUT_SECS: u64 = 10;
 
     #[derive(Deserialize)]
@@ -182,6 +222,39 @@ mod net {
         items: Vec<Playlist>,
         #[serde(default)]
         total: u32,
+    }
+
+    // /v1/albums/{id} inlines the first page of (simplified) tracks + a total.
+    #[derive(Deserialize)]
+    struct RawAlbumTracks {
+        #[serde(default = "Vec::new")]
+        items: Vec<Track>,
+        #[serde(default)]
+        total: u32,
+    }
+
+    #[derive(Deserialize)]
+    struct RawAlbum {
+        name: String,
+        #[serde(default)]
+        uri: String,
+        #[serde(default)]
+        artists: Vec<Artist>,
+        tracks: RawAlbumTracks,
+    }
+
+    #[derive(Deserialize)]
+    struct RawArtistAlbums {
+        #[serde(default = "Vec::new")]
+        items: Vec<Album>,
+        #[serde(default)]
+        total: u32,
+    }
+
+    #[derive(Deserialize)]
+    struct RawTopTracks {
+        #[serde(default = "Vec::new")]
+        tracks: Vec<Track>,
     }
 
     #[derive(Deserialize)]
@@ -423,6 +496,53 @@ mod net {
             let items = raw.items.into_iter().filter_map(|i| i.track).collect();
             Ok(TracksPage { items, total: raw.total, offset })
         }
+
+        fn album(&self, id: &str) -> Result<AlbumDetail, ApiError> {
+            let body =
+                self.get_cached(&format!("album:{id}"), CATALOG_TTL, &format!("/v1/albums/{id}"))?;
+            let r: RawAlbum = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+            Ok(AlbumDetail { name: r.name, uri: r.uri, artists: r.artists, total: r.tracks.total })
+        }
+
+        fn album_tracks(&self, id: &str, offset: u32) -> Result<TracksPage, ApiError> {
+            let body = self.get_cached(
+                &format!("albumtracks:{id}:{offset}"),
+                CATALOG_TTL,
+                &format!("/v1/albums/{id}/tracks?limit={PAGE_SIZE}&offset={offset}"),
+            )?;
+            let r: RawAlbumTracks = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+            Ok(TracksPage { items: r.items, total: r.total, offset })
+        }
+
+        fn artist(&self, id: &str) -> Result<Artist, ApiError> {
+            let body =
+                self.get_cached(&format!("artist:{id}"), CATALOG_TTL, &format!("/v1/artists/{id}"))?;
+            serde_json::from_str(&body).map_err(|e| format!("artist parse failed: {e}"))
+        }
+
+        fn artist_albums(&self, id: &str, offset: u32) -> Result<AlbumsPage, ApiError> {
+            let body = self.get_cached(
+                &format!("artistalbums:{id}:{offset}"),
+                CATALOG_TTL,
+                &format!(
+                    "/v1/artists/{id}/albums?include_groups=album,single&limit={PAGE_SIZE}&offset={offset}"
+                ),
+            )?;
+            let r: RawArtistAlbums = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+            Ok(AlbumsPage { items: r.items, total: r.total, offset })
+        }
+
+        fn artist_top_tracks(&self, id: &str) -> Result<Vec<Track>, ApiError> {
+            // market=from_token: Spotify infers the market from the user token, so
+            // we don't need to store the account country.
+            let body = self.get_cached(
+                &format!("artisttop:{id}"),
+                CATALOG_TTL,
+                &format!("/v1/artists/{id}/top-tracks?market=from_token"),
+            )?;
+            let r: RawTopTracks = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+            Ok(r.tracks)
+        }
     }
 
     fn non_empty(var: &str) -> Option<String> {
@@ -532,6 +652,15 @@ mod tests {
     fn nothing_playing_when_item_null() {
         let p: Playing = serde_json::from_str(r#"{"is_playing": false, "item": null}"#).unwrap();
         assert!(p.item.is_none());
+    }
+
+    #[test]
+    fn id_from_uri_extracts_or_none() {
+        assert_eq!(id_from_uri("spotify:album:qd"), Some("qd"));
+        assert_eq!(id_from_uri("spotify:artist:sm"), Some("sm"));
+        assert_eq!(id_from_uri(""), None);
+        assert_eq!(id_from_uri("nope"), None);
+        assert_eq!(id_from_uri("spotify:album:"), None);
     }
 
     #[test]
