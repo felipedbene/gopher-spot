@@ -303,19 +303,30 @@ fn search_entries(query: &str, r: &SearchResults) -> Vec<Entry> {
             }
         }
     }
-    // Artists / albums are shown as context (not playable in Fio C).
+    // Artists / albums are playable as a CONTEXT (multiple songs): selecting an
+    // artist plays its top tracks, an album plays the whole thing. play() routes
+    // a non-track URI through context_uri. Fall back to a plain line if the API
+    // omitted the uri.
     if let Some(artists) = r.artists.as_ref().filter(|p| !p.items.is_empty()) {
         e.push(info(""));
         e.push(info("Artistas:"));
         for a in artists.items.iter().take(5) {
-            e.push(info(clip(&format!("  {}", a.name))));
+            if a.uri.is_empty() {
+                e.push(info(clip(&format!("  {}", a.name))));
+            } else {
+                e.push(link(ItemKind::Menu, clip(&a.name), format!("/spot/play?uri={}", a.uri)));
+            }
         }
     }
     if let Some(albums) = r.albums.as_ref().filter(|p| !p.items.is_empty()) {
         e.push(info(""));
         e.push(info("Albuns:"));
         for a in albums.items.iter().take(5) {
-            e.push(info(clip(&format!("  {}", a.name))));
+            if a.uri.is_empty() {
+                e.push(info(clip(&format!("  {}", a.name))));
+            } else {
+                e.push(link(ItemKind::Menu, clip(&a.name), format!("/spot/play?uri={}", a.uri)));
+            }
         }
     }
     e.push(info(""));
@@ -531,8 +542,8 @@ mod tests {
                 tracks: Some(Page {
                     items: vec![Track {
                         name: format!("Faixa {q}"),
-                        artists: vec![Artist { name: "Chico".into() }],
-                        album: Some(Album { name: "Al".into() }),
+                        artists: vec![Artist { name: "Chico".into(), uri: String::new() }],
+                        album: Some(Album { name: "Al".into(), uri: String::new() }),
                         id: Some("tid".into()),
                         uri: "spotify:track:tid".into(),
                         duration_ms: 0,
@@ -545,8 +556,8 @@ mod tests {
         fn track(&self, id: &str) -> Result<Track, ApiError> {
             Ok(Track {
                 name: format!("Track {id}"),
-                artists: vec![Artist { name: "Chico".into() }],
-                album: Some(Album { name: "Al".into() }),
+                artists: vec![Artist { name: "Chico".into(), uri: String::new() }],
+                album: Some(Album { name: "Al".into(), uri: String::new() }),
                 id: Some(id.into()),
                 uri: format!("spotify:track:{id}"),
                 duration_ms: 380000,
@@ -573,8 +584,8 @@ mod tests {
         fn playlist_tracks(&self, _id: &str, offset: u32) -> Result<TracksPage, ApiError> {
             let items = vec![Track {
                 name: "Faixa X".into(),
-                artists: vec![Artist { name: "Chico".into() }],
-                album: Some(Album { name: "Al".into() }),
+                artists: vec![Artist { name: "Chico".into(), uri: String::new() }],
+                album: Some(Album { name: "Al".into(), uri: String::new() }),
                 id: Some("tx".into()),
                 uri: "spotify:track:tx".into(),
                 duration_ms: 0,
@@ -590,8 +601,8 @@ mod tests {
                 progress_ms: 1000,
                 item: Some(Track {
                     name: "Construção".into(),
-                    artists: vec![Artist { name: "Chico Buarque".into() }],
-                    album: Some(Album { name: "Construção".into() }),
+                    artists: vec![Artist { name: "Chico Buarque".into(), uri: String::new() }],
+                    album: Some(Album { name: "Construção".into(), uri: String::new() }),
                     id: Some("abc".into()),
                     uri: "spotify:track:abc".into(),
                     duration_ms: 380000,
@@ -630,6 +641,23 @@ mod tests {
         let f = fake();
         let out = r("", "/spot/track/xyz", Some(&f));
         assert!(out.contains("[1|>> Tocar agora|/spot/play?uri=spotify:track:xyz|server|port]"));
+    }
+
+    #[test]
+    fn search_albums_and_artists_are_playable_contexts() {
+        let r = SearchResults {
+            tracks: None,
+            artists: Some(Page {
+                items: vec![Artist { name: "The Smiths".into(), uri: "spotify:artist:sm".into() }],
+            }),
+            albums: Some(Page {
+                items: vec![Album { name: "The Queen Is Dead".into(), uri: "spotify:album:qd".into() }],
+            }),
+        };
+        let out = render_menu_index(&search_entries("smiths", &r));
+        // Both link to /spot/play with their context URI (album/artist, not track).
+        assert!(out.contains("[1|The Smiths|/spot/play?uri=spotify:artist:sm|server|port]"));
+        assert!(out.contains("[1|The Queen Is Dead|/spot/play?uri=spotify:album:qd|server|port]"));
     }
 
     #[test]

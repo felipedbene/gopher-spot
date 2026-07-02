@@ -29,11 +29,18 @@ pub type ApiError = String;
 #[derive(Debug, Clone, Deserialize)]
 pub struct Artist {
     pub name: String,
+    /// `spotify:artist:…` — playing it as a context starts the artist's top
+    /// tracks / radio. Empty if the API omitted it.
+    #[serde(default)]
+    pub uri: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Album {
     pub name: String,
+    /// `spotify:album:…` — playing it as a context plays the whole album.
+    #[serde(default)]
+    pub uri: String,
 }
 
 /// A track (subset we render). `uri` drives playback; `id` builds detail links.
@@ -365,7 +372,14 @@ mod net {
         fn play(&self, uri: &str) -> Result<(), ApiError> {
             let device = self.device_id()?;
             let token = self.access_token()?;
-            let body = serde_json::json!({ "uris": [uri] }).to_string();
+            // A single track plays via `uris`; an album/artist/playlist is a
+            // *context* (`context_uri`) so it plays the whole thing, not one song.
+            let body = if uri.starts_with("spotify:track:") {
+                serde_json::json!({ "uris": [uri] })
+            } else {
+                serde_json::json!({ "context_uri": uri })
+            }
+            .to_string();
             self.agent
                 .put(&format!("{API}/v1/me/player/play?device_id={device}"))
                 .set("Authorization", &format!("Bearer {token}"))
