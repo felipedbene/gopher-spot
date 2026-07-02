@@ -35,21 +35,28 @@ LIBRESPOT_CACHE="${LIBRESPOT_CACHE:-/cache}"
 # The stream should leave librespot at unity gain; do any attenuation downstream
 # (the MacAST client, or the /spot/control volume command). Override if desired.
 LIBRESPOT_VOLUME="${LIBRESPOT_VOLUME:-100}"
+# Radio-style continuation when the queue empties (see the --autoplay note below).
+LIBRESPOT_AUTOPLAY="${LIBRESPOT_AUTOPLAY:-on}"
 MP3_BITRATE="${MP3_BITRATE:-128k}"
 # Source password for the internal librespot→ffmpeg→Icecast link. Localhost-only,
 # so a fixed default is fine; override if paranoid.
 ICECAST_SOURCE_PASS="${ICECAST_SOURCE_PASS:-gopher-spot-src}"
 
 # --- librespot args by discovery mode (see README "Discovery") --------------
+# --autoplay on: when the queue runs dry (e.g. a single track played via the Web
+# API with no album/playlist context), librespot resolves a radio station from
+# the last track and keeps playing instead of stopping ("no more tracks left in
+# queue"). Makes single-track plays behave like a radio.
 librespot_common="--backend pipe --name ${LIBRESPOT_NAME} \
   --bitrate ${LIBRESPOT_BITRATE} --device-type speaker \
-  --initial-volume ${LIBRESPOT_VOLUME}"
+  --initial-volume ${LIBRESPOT_VOLUME} --autoplay ${LIBRESPOT_AUTOPLAY}"
 case "$LIBRESPOT_MODE" in
   credentials)
     LIBRESPOT_SEED="${LIBRESPOT_SEED:-/seed/credentials.json}"
     if [ ! -f "$LIBRESPOT_CACHE/credentials.json" ] && [ -f "$LIBRESPOT_SEED" ]; then
       mkdir -p "$LIBRESPOT_CACHE"
       cp "$LIBRESPOT_SEED" "$LIBRESPOT_CACHE/credentials.json"
+      chmod 600 "$LIBRESPOT_CACHE/credentials.json" 2>/dev/null || true
       echo "audio-stream: seeded credentials.json from $LIBRESPOT_SEED" >&2
     fi
     if [ ! -f "$LIBRESPOT_CACHE/credentials.json" ]; then
