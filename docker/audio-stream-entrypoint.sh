@@ -9,17 +9,32 @@
 # stay; a silence fallback covers the gaps.
 #
 # Pipeline:
-#   librespot --backend pipe  →  ffmpeg (s16le → MP3)  →  Icecast /spotify.mp3
-#   ffmpeg (anullsrc → MP3)   →  Icecast /silence.mp3   (always-on fallback)
+#   librespot --backend pipe  →  FIFO  →  ffmpeg (s16le → MP3)  →  Icecast /spotify.mp3
+#   ffmpeg (anullsrc → MP3)              →  Icecast /silence.mp3   (always-on fallback)
 # /spotify.mp3 has fallback-mount=/silence.mp3 + fallback-override, so when the
 # live source drops (idle > source-timeout) listeners hear silence, and snap back
 # to live when a track plays. Clients only ever dial :8000/spotify.mp3.
+#
+# Why the FIFO (and not a bare `librespot | ffmpeg` pipe): when librespot idles it
+# STOPS producing PCM but STAYS ALIVE, so ffmpeg stalls; Icecast drops the source
+# after source-timeout; and when a track resumes ffmpeg writes to the now-closed
+# Icecast socket → "Broken pipe", ffmpeg dies. In a bare pipe librespot survives
+# ffmpeg's death, so `librespot | ffmpeg` never returns and the `while` loop never
+# respawns — the live mount stays dead until a pod restart. Routing PCM through a
+# FIFO lets us hold librespot's PID and, the moment ffmpeg exits, KILL librespot so
+# the loop tears the whole chain down and respawns it with a FRESH Icecast source.
 set -eu
 
 LIBRESPOT_MODE="${LIBRESPOT_MODE:-credentials}"
 LIBRESPOT_NAME="${LIBRESPOT_NAME:-gopher-spot}"
 LIBRESPOT_BITRATE="${LIBRESPOT_BITRATE:-320}"
 LIBRESPOT_CACHE="${LIBRESPOT_CACHE:-/cache}"
+# Start at full scale. librespot applies its software volume to the pipe samples,
+# and its DEFAULT initial volume (~50%) on a LOGARITHMIC taper sounds very quiet —
+# and the /cache emptyDir is wiped every pod start, so it never remembers louder.
+# The stream should leave librespot at unity gain; do any attenuation downstream
+# (the MacAST client, or the /spot/control volume command). Override if desired.
+LIBRESPOT_VOLUME="${LIBRESPOT_VOLUME:-100}"
 MP3_BITRATE="${MP3_BITRATE:-128k}"
 # Source password for the internal librespot→ffmpeg→Icecast link. Localhost-only,
 # so a fixed default is fine; override if paranoid.
@@ -27,7 +42,8 @@ ICECAST_SOURCE_PASS="${ICECAST_SOURCE_PASS:-gopher-spot-src}"
 
 # --- librespot args by discovery mode (see README "Discovery") --------------
 librespot_common="--backend pipe --name ${LIBRESPOT_NAME} \
-  --bitrate ${LIBRESPOT_BITRATE} --device-type speaker"
+  --bitrate ${LIBRESPOT_BITRATE} --device-type speaker \
+  --initial-volume ${LIBRESPOT_VOLUME}"
 case "$LIBRESPOT_MODE" in
   credentials)
     LIBRESPOT_SEED="${LIBRESPOT_SEED:-/seed/credentials.json}"
@@ -59,9 +75,18 @@ cat > "$IC/icecast.xml" <<EOF
   <limits>
     <clients>20</clients>
     <sources>4</sources>
-    <source-timeout>10</source-timeout>
-    <burst-size>65536</burst-size>
-    <queue-size>1048576</queue-size>
+    <!-- Tolerate slow inter-song track loads without dropping the live source
+         (a drop forces a failover→silence + a full live-chain respawn). Long
+         genuine idle/pause still exceeds this and correctly fails to silence. -->
+    <source-timeout>20</source-timeout>
+    <!-- Keep listeners near the live edge. burst-size is the backlog sent on
+         connect (prebuffer): ~1s at 128k. queue-size caps how far a slightly-slow
+         client may drift before Icecast trims it: ~16s instead of the old ~64s
+         (a full song). Lower these further only if the client keeps up cleanly;
+         if MacAST underruns/disconnects, it can't sustain the bitrate — drop
+         MP3_BITRATE instead. -->
+    <burst-size>16384</burst-size>
+    <queue-size>262144</queue-size>
   </limits>
   <authentication>
     <source-password>${ICECAST_SOURCE_PASS}</source-password>
@@ -108,14 +133,33 @@ sleep 3
   done
 ) &
 
-# Live source: librespot | ffmpeg -> /spotify.mp3. On idle librespot stops
-# producing, ffmpeg stalls, Icecast's source-timeout drops the mount and listeners
-# fail over to silence; a track resumes the loop and snaps them back.
+# Live source: librespot -> FIFO -> ffmpeg -> /spotify.mp3.
+#
+# librespot writes PCM into the FIFO in the background so we keep its PID; ffmpeg
+# reads the FIFO in the foreground, so this loop iterates the instant ffmpeg exits.
+# ffmpeg only exits when its Icecast source socket has died — i.e. after a long
+# idle/pause let Icecast time the source out and a resuming track hit the stale
+# socket ("Broken pipe"). We then KILL librespot (it survives ffmpeg's death and
+# would otherwise sit there writing into a dead pipe forever) and respawn the whole
+# chain: a fresh librespot + fresh ffmpeg get a brand-new /spotify.mp3 source, and
+# fallback-override snaps parked listeners from silence back to live.
+#
+# No `-re` on the pipe input: librespot already produces PCM at realtime, so `-re`
+# would only add a second throttle and risk a catch-up burst after a gap.
+FIFO=/tmp/spotify.pcm
+[ -p "$FIFO" ] || mkfifo "$FIFO"
 while true; do
-  librespot "$@" \
-    | ffmpeg -hide_banner -loglevel warning -re -f s16le -ar 44100 -ac 2 -i pipe:0 \
-             -c:a libmp3lame -b:a "$MP3_BITRATE" -write_xing 0 -f mp3 -legacy_icecast 1 \
-             -content_type audio/mpeg "$(ice_url spotify.mp3)" || true
-  echo "audio-stream: live source ended, respawning in 2s" >&2
+  librespot "$@" > "$FIFO" &
+  LR=$!
+  # `-re` throttles output to real time. For raw PCM (no embedded timestamps) it
+  # paces by SAMPLE COUNT, so there's no post-gap catch-up burst — it just stops
+  # ffmpeg from flooding Icecast's queue, which is what makes listeners drift a
+  # whole song behind the live edge.
+  ffmpeg -hide_banner -loglevel warning -re -f s16le -ar 44100 -ac 2 -i "$FIFO" \
+         -c:a libmp3lame -b:a "$MP3_BITRATE" -write_xing 0 -f mp3 -legacy_icecast 1 \
+         -content_type audio/mpeg "$(ice_url spotify.mp3)" || true
+  echo "audio-stream: live encoder exited, tearing down librespot + respawning in 2s" >&2
+  kill "$LR" 2>/dev/null || true
+  wait "$LR" 2>/dev/null || true
   sleep 2
 done
