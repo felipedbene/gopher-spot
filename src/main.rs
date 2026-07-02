@@ -6,14 +6,16 @@
 //!   gopher-spot oauth-init                        (net feature only)
 //!       One-shot Spotify Authorization Code flow; prints REFRESH_TOKEN=... .
 //!
-//! All gophermap output is transcoded to MacRoman on the way to stdout so
-//! the OS 9 gopher client (Netscape Communicator, or TurboGopher) renders accented
-//! track names cleanly (ASCII is identity).
+//! All gophermap output is transcoded on the way to stdout so the OS 9 gopher
+//! client renders accented track names cleanly (ASCII is always identity). The
+//! active client is Netscape Communicator, which reads charset-less Gopher as
+//! Latin-1 — that's the default. Override with `GOPHER_ENCODING=macroman|utf8`
+//! (macroman for TurboGopher; utf8 for a raw passthrough).
 
 use std::io::Write;
 use std::process::ExitCode;
 
-use gopher_spot::{dcgi, macroman, menu};
+use gopher_spot::{dcgi, latin1, macroman, menu};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -35,10 +37,16 @@ fn main() -> ExitCode {
     }
 }
 
-/// Write a rendered gophermap to stdout as MacRoman bytes (the wire encoding OS 9
-/// expects). ASCII passes through unchanged.
+/// Write a rendered gophermap to stdout, transcoded to the client's charset.
+/// Default Latin-1 (Netscape Communicator); `GOPHER_ENCODING` overrides. ASCII —
+/// including every byte geomyidae parses — is identity under all three.
 fn emit(gph: &str) {
-    let _ = std::io::stdout().write_all(&macroman::encode(gph));
+    let bytes = match std::env::var("GOPHER_ENCODING").as_deref() {
+        Ok("macroman") => macroman::encode(gph),
+        Ok("utf8") => gph.as_bytes().to_vec(),
+        _ => latin1::encode(gph),
+    };
+    let _ = std::io::stdout().write_all(&bytes);
 }
 
 /// Route a dcgi request. On the `net` build we try to construct a live Spotify
