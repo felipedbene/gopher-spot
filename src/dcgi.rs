@@ -186,6 +186,14 @@ fn playlist(id: &str, args: &DcgiArgs, api: Option<&dyn SpotifyApi>) -> String {
     match api {
         Some(a) => match a.playlist_tracks(id, offset) {
             Ok(t) => page(playlist_tracks_entries(id, &t)),
+            // Spotify 403/404s editorial & algorithmic playlists (Discover Weekly,
+            // Daily Mix, Release Radar…) and other users' private ones — since the
+            // Nov-2024 Web API dev-mode restriction, apps can't read them. These
+            // still appear in /v1/me/playlists, so the user can click into one.
+            // Show a plain note instead of a raw "spotify HTTP 403".
+            Err(e) if e.contains("HTTP 403") || e.contains("HTTP 404") => {
+                page(playlist_unavailable_entries())
+            }
             Err(e) => page(error_entries(&e)),
         },
         None => mock("Playlist", &format!("(mock) faixas da playlist {id} -- Fio D")),
@@ -201,6 +209,7 @@ fn control(sub: &str, api: Option<&dyn SpotifyApi>) -> String {
         }
     } else {
         match sub {
+            "play" => (Control::Resume, "tocando".to_string()),
             "pause" => (Control::Pause, "pausado".to_string()),
             "next" => (Control::Next, "proxima".to_string()),
             "prev" => (Control::Prev, "anterior".to_string()),
@@ -209,11 +218,11 @@ fn control(sub: &str, api: Option<&dyn SpotifyApi>) -> String {
     };
     match api {
         Some(a) => match a.control(cmd) {
+            // Back to Now Playing (controls live there now), not the old submenu.
             Ok(()) => page(vec![
                 info(format!("ok: {label}")),
                 info(""),
                 link(ItemKind::Menu, "Now Playing", "/spot/now"),
-                link(ItemKind::Menu, "Controles", "/spot/control"),
                 link(ItemKind::Menu, "Voltar ao menu", "/"),
             ]),
             Err(e) => page(error_entries(&e)),
@@ -234,8 +243,29 @@ fn now_entries(p: &Playing) -> Vec<Entry> {
                 e.push(info(clip(&format!("album: {}", al.name))));
             }
             e.push(info(if p.is_playing { "[tocando]" } else { "[pausado]" }));
+            // If the active device isn't gopher-spot, the audio stream (which only
+            // carries librespot's output) is NOT what this menu shows — warn, so a
+            // stale/other-device track doesn't look like what you hear.
+            if let Some(dev) = &p.device {
+                if dev.name != "gopher-spot" {
+                    e.push(info(clip(&format!("(tocando em {}, nao no", dev.name))));
+                    e.push(info(" gopher-spot -- transfira o playback)"));
+                }
+            }
             e.push(info(""));
-            e.push(link(ItemKind::Menu, "Controles", "/spot/control"));
+            // Controls inline (not behind a submenu) — the menu re-renders on each
+            // fetch, so the play/pause toggle always offers the opposite of the
+            // current state.
+            if p.is_playing {
+                e.push(link(ItemKind::Menu, "Pausar", "/spot/control/pause"));
+            } else {
+                e.push(link(ItemKind::Menu, "Tocar", "/spot/control/play"));
+            }
+            e.push(link(ItemKind::Menu, "<< Anterior", "/spot/control/prev"));
+            e.push(link(ItemKind::Menu, ">> Proxima", "/spot/control/next"));
+            e.push(link(ItemKind::Menu, "Volume 30%", "/spot/control/vol/30"));
+            e.push(link(ItemKind::Menu, "Volume 70%", "/spot/control/vol/70"));
+            e.push(link(ItemKind::Menu, "Volume 100%", "/spot/control/vol/100"));
         }
         None => {
             e.push(info("Nada tocando agora."));
@@ -359,6 +389,7 @@ fn control_menu() -> Vec<Entry> {
     vec![
         info("Controles"),
         info(""),
+        link(ItemKind::Menu, "Tocar", "/spot/control/play"),
         link(ItemKind::Menu, "Pause", "/spot/control/pause"),
         link(ItemKind::Menu, "Proxima", "/spot/control/next"),
         link(ItemKind::Menu, "Anterior", "/spot/control/prev"),
@@ -367,6 +398,19 @@ fn control_menu() -> Vec<Entry> {
         link(ItemKind::Menu, "Volume 100%", "/spot/control/vol/100"),
         info(""),
         link(ItemKind::Menu, "Now Playing", "/spot/now"),
+        link(ItemKind::Menu, "Voltar ao menu", "/"),
+    ]
+}
+
+fn playlist_unavailable_entries() -> Vec<Entry> {
+    vec![
+        info("Playlist indisponivel"),
+        info(""),
+        info("O Spotify nao permite ler esta playlist"),
+        info("pela Web API (editorial/algoritmica, ou"),
+        info("privada de outro usuario)."),
+        info(""),
+        link(ItemKind::Menu, "Minhas playlists", "/spot/playlists"),
         link(ItemKind::Menu, "Voltar ao menu", "/"),
     ]
 }
@@ -536,6 +580,7 @@ mod tests {
                     uri: "spotify:track:abc".into(),
                     duration_ms: 380000,
                 }),
+                device: None,
             },
         }
     }

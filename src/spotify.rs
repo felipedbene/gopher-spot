@@ -14,6 +14,7 @@ use serde::Deserialize;
 /// A playback control command (`/spot/control/*`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Control {
+    Resume,
     Pause,
     Next,
     Prev,
@@ -69,6 +70,11 @@ pub struct Playing {
     #[serde(default)]
     pub progress_ms: u64,
     pub item: Option<Track>,
+    /// The active device (from `/v1/me/player`). Lets the menu tell whether the
+    /// gopher-spot/librespot device — the one the audio stream carries — is what's
+    /// actually playing, vs. some other device (phone/desktop) on the account.
+    #[serde(default)]
+    pub device: Option<Device>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -268,11 +274,15 @@ mod net {
                 .agent
                 .request(method, &format!("{API}{path}"))
                 .set("Authorization", &format!("Bearer {token}"));
-            // PUT play/pause/volume want a JSON content-type even with an empty body.
+            // Spotify rejects a body-less POST/PUT with 411 Length Required, so every
+            // command must send an explicit body to carry a Content-Length. PUT
+            // play/pause/volume want a JSON object; POST next/previous take an empty
+            // body — but it must still be sent as `""` (Content-Length: 0), NOT via
+            // `.call()`, which omits the header entirely and triggers the 411.
             let res = if method == "PUT" {
                 req.set("Content-Type", "application/json").send_string("{}")
             } else {
-                req.call()
+                req.send_string("")
             };
             res.map(|_| ()).map_err(api_err)
         }
@@ -305,10 +315,12 @@ mod net {
 
     impl SpotifyApi for Client {
         fn now_playing(&self) -> Result<Playing, ApiError> {
-            let resp = self.get("/v1/me/player/currently-playing")?;
-            // 204 No Content == nothing playing.
+            // /v1/me/player (not .../currently-playing) so we also get `device`,
+            // to tell whether the gopher-spot device — the one the stream carries —
+            // is actually the active one. 204 No Content == no active device.
+            let resp = self.get("/v1/me/player")?;
             if resp.status() == 204 {
-                return Ok(Playing { is_playing: false, progress_ms: 0, item: None });
+                return Ok(Playing { is_playing: false, progress_ms: 0, item: None, device: None });
             }
             resp.into_json().map_err(|e| format!("now-playing parse failed: {e}"))
         }
@@ -348,6 +360,8 @@ mod net {
 
         fn control(&self, cmd: Control) -> Result<(), ApiError> {
             match cmd {
+                // Resume with no `uris`: PUT play just un-pauses the current track.
+                Control::Resume => self.command("PUT", "/v1/me/player/play"),
                 Control::Pause => self.command("PUT", "/v1/me/player/pause"),
                 Control::Next => self.command("POST", "/v1/me/player/next"),
                 Control::Prev => self.command("POST", "/v1/me/player/previous"),
