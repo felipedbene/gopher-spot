@@ -1,255 +1,508 @@
 # gopher-spot
 
-Spotify Connect receiver + Gopher UI for Mac OS 9. Runs 100% on the home
-`debene` Kubernetes cluster, LAN-only. See [PROMPT.md](PROMPT.md) for the full
-design brief.
+**Spotify Connect, controlled from Mac OS 9 over the Gopher protocol (RFC 1436,
+1991). Runs 100% on a homelab Kubernetes cluster. LAN-only.**
 
-Two pods, two MetalLB LoadBalancer IPs:
+You search, browse playlists, and drive playback from **TurboGopher** (or
+Netscape's gopher client) on a 1999 Mac — inside a UTM/QEMU VM, or on real
+hardware — and the music comes out of **Audion 3** parked on an MP3 stream. No
+Spotify app, no browser, no JavaScript, no TLS. A protocol older than the Web
+carries a 2020s streaming service to an OS that shipped on beige plastic.
 
-- **audio-stream** — `librespot | ffmpeg` → MP3 128k CBR at `:8000/spotify.mp3`.
-  Audion on OS 9 stays parked on this URL.
-- **gopher-server** — geomyidae + the `gopher-spot` dcgi, Gopher on `:70`.
-  TurboGopher browses/searches/controls; it never sees the MP3.
-
-This project does **not** touch the VPS `gopher.debene.dev`. Homelab k8s only.
-
-## LoadBalancer IPs (fill in after first apply)
-
-MetalLB pool turned out to be `10.0.100.x` (the PROMPT guessed `10.0.10.x`).
-
-| Service        | Port | LAN IP          | `.lan` name (Technitium) |
-|----------------|------|-----------------|--------------------------|
-| audio-stream   | 8000 | `10.0.100.___`  | `audio-stream.lan`       |
-| gopher-server  | 70   | `10.0.100.112`  | `gopher-spot.lan`        |
-
-```sh
-kubectl -n gopher-spot get svc -o wide   # read EXTERNAL-IP here
-```
+It works. That is the whole point. See [PROMPT.md](PROMPT.md) for the original
+design brief and [the build story](#build-story) for what it cost.
 
 ---
 
-## Design decisions (answers to the three PROMPT questions)
+## Contents
+
+- [The idea in one diagram](#the-idea-in-one-diagram)
+- [How a "play this track" request flows](#how-a-play-this-track-request-flows)
+- [Code map (UML)](#code-map-uml)
+- [dcgi routing](#dcgi-routing)
+- [Audio delivery: the Icecast fallback](#audio-delivery-the-icecast-fallback)
+- [Design decisions](#design-decisions)
+- [Hard-won gotchas](#hard-won-gotchas)
+- [Build & deploy](#build--deploy)
+- [Build story](#build-story)
+- [Repo layout](#repo-layout)
+
+---
+
+## The idea in one diagram
+
+The trick is a **split between the control plane and the data plane**. Gopher was
+never going to carry a 128 kbps MP3 to a G3 — so it doesn't. TurboGopher only ever
+sends and receives tiny text menus; the audio travels on a completely separate
+HTTP stream that a dedicated MP3 player (Audion) holds open. Two MetalLB
+LoadBalancer IPs, two jobs.
+
+```mermaid
+flowchart TB
+    subgraph os9["🖥️  Mac OS 9  (UTM / QEMU guest, or real hardware)"]
+        direction LR
+        TG["TurboGopher<br/><i>control plane</i><br/>gopher :70"]
+        AU["Audion 3<br/><i>data plane</i><br/>HTTP MP3 :8000"]
+    end
+
+    subgraph k8s["☸  debene homelab cluster  (vanilla kubeadm, mixed amd64/arm64)"]
+        direction TB
+        subgraph gsp["gopher-server Pod ·  replicas 2"]
+            GEO["geomyidae"] -->|execs .dcgi| DCGI["gopher-spot dcgi<br/>(Rust, musl static)"]
+        end
+        subgraph asp["audio-stream Pod ·  replicas 1"]
+            LS["librespot<br/>(pipe backend)"] -->|s16le PCM| FF["ffmpeg<br/>→ MP3 128k"] -->|source| IC["Icecast"]
+        end
+        LB1(["Service LB<br/>10.0.100.112:70"])
+        LB2(["Service LB<br/>10.0.100.113:8000"])
+        GEO --- LB1
+        IC --- LB2
+    end
+
+    SPOT["Spotify backend<br/>(Web API + Connect AP)"]
+
+    TG -- "gopher menus (MacRoman text)" --> LB1
+    AU -- "GET /spotify.mp3 (parked)" --> LB2
+    DCGI -- "HTTPS: search / play / control<br/>(blocking ureq, OAuth)" --> SPOT
+    LS  -- "HTTPS: log in as Connect device<br/>(cached credentials.json)" --> SPOT
+
+    classDef os fill:#1d3b53,stroke:#4fd1c5,color:#e6f6ff
+    classDef cluster fill:#2a2a3c,stroke:#8b8bff,color:#eee
+    classDef ext fill:#1a5c3a,stroke:#4fd18b,color:#e6fff0
+    class TG,AU os
+    class GEO,DCGI,LS,FF,IC,LB1,LB2 cluster
+    class SPOT ext
+```
+
+Key consequences of the split:
+
+- **OS 9 never touches the MP3 through Gopher.** TurboGopher issues a `PUT play`
+  via the dcgi; the audio is already flowing to Audion on the other socket.
+- **The dcgi has no idea what audio sounds like.** It's a stateless text
+  transformer: selector in, gophermap out.
+- **librespot never opens a port for OS 9.** It's an *outbound* Spotify Connect
+  device; the phone/desktop "transfers playback" to it through Spotify's cloud,
+  and it pipes raw PCM into ffmpeg locally.
+
+---
+
+## How a "play this track" request flows
+
+The moment that makes the whole thing feel like magic: you pick a track in a
+gopher menu on a 25-year-old Mac and, a beat later, it's playing.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as You (OS 9)
+    participant TG as TurboGopher
+    participant GEO as geomyidae :70
+    participant D as gopher-spot dcgi
+    participant API as Spotify Web API
+    participant LS as librespot (device)
+    participant IC as Icecast :8000
+    participant AU as Audion 3
+
+    Note over AU,IC: Audion has been parked on :8000/spotify.mp3 since boot,<br/>hearing silence while nothing plays.
+
+    U->>TG: select "Buscar" (type-7), type "chico buarque"
+    TG->>GEO: gopher request  /spot/search  + query
+    GEO->>D: exec index.dcgi $search … $selector
+    D->>API: GET /v1/search?type=track&limit=10  (blocking ureq)
+    API-->>D: JSON results
+    D-->>GEO: gophermap: track list as /spot/track/{id} links (MacRoman)
+    GEO-->>TG: menu
+
+    U->>TG: select a track → ">> Tocar agora"
+    TG->>GEO: /spot/play?uri=spotify:track:…
+    GEO->>D: exec
+    D->>API: GET /v1/me/player/devices  (find "gopher-spot", cache 30s)
+    API-->>D: device_id
+    D->>API: PUT /v1/me/player/play?device_id=…  { uris:[…] }
+    API-->>LS: Connect: start this track
+    LS->>IC: PCM → ffmpeg → MP3 source on /spotify.mp3
+    IC-->>AU: live audio overrides the silence fallback
+    D-->>TG: "Mandando tocar…" confirmation menu
+    Note over AU: 🎵 you hear "Construção"
+```
+
+The dcgi is exec'd **fresh for every one of those arrows** — geomyidae spawns a
+new process per request. That single fact drives half the architecture (see the
+[disk cache](#code-map-uml) and [the caching decision](#design-decisions)).
+
+---
+
+## Code map (UML)
+
+One Rust binary, `gopher-spot`, wears three hats depending on argv (`root`,
+`dcgi`, `oauth-init`). The library is deliberately split so **everything except
+the HTTP client compiles and tests without a network** — the `net` Cargo feature
+gates only `ureq`. Rendering is tested against a fake `SpotifyApi`.
+
+```mermaid
+classDiagram
+    direction LR
+
+    class main {
+        <<binary>>
+        +main() ExitCode
+        -emit(gph) : MacRoman to stdout
+        -run_dcgi(argv) String
+    }
+    class oauth {
+        <<net feature>>
+        +run() ExitCode
+        one-shot Auth Code flow
+        catches :8888 callback
+    }
+
+    class DcgiArgs {
+        +search String
+        +arguments String
+        +host String
+        +port String
+        +traversal String
+        +selector String
+        +from_argv(rest) DcgiArgs
+        +path() String
+        +query(key) Option~String~
+    }
+    class route {
+        <<function>>
+        +route(args, Option~SpotifyApi~) String
+        matches selector → handler
+    }
+
+    class SpotifyApi {
+        <<trait>>
+        +now_playing() Playing
+        +search(q) SearchResults
+        +track(id) Track
+        +play(uri)
+        +control(cmd)
+        +playlists(offset) PlaylistsPage
+        +playlist_tracks(id, offset) TracksPage
+    }
+    class Client {
+        <<net feature — blocking ureq>>
+        -refresh_token, client_id/secret
+        -state_dir, agent
+        +from_env(now, dir) Option~Client~
+        -access_token() String
+        -device_id() String
+    }
+    class Fake {
+        <<test double>>
+        canned responses, no network
+    }
+
+    class Control {
+        <<enum>>
+        Pause / Next / Prev / Volume(u8)
+    }
+    class models {
+        Track, Artist, Album
+        Playing, SearchResults, Page~T~
+        Device, Playlist
+        PlaylistsPage, TracksPage
+    }
+
+    class cache {
+        <<module — file TTL cache>>
+        +get(dir, key, now) Option~String~
+        +put(dir, key, now, ttl, val)
+        FNV-1a keyed files: expiry\npayload
+    }
+    class macroman {
+        <<module>>
+        +encode(utf8) Vec~u8~
+        UTF-8 → MacRoman at the IO edge
+    }
+    class menu {
+        <<module>>
+        +root_gph() String
+        +clip(s) : ≤66 cols (RFC 1436)
+        +sound_line() : type-s .pls item
+    }
+    class gopher_core {
+        <<external crate>>
+        Entry, ItemKind
+        info(), link(), render_menu_index()
+    }
+
+    main ..> route : dcgi mode
+    main ..> menu : root mode
+    main ..> macroman : emit()
+    main ..> oauth : oauth-init mode
+    route ..> DcgiArgs : parses
+    route ..> SpotifyApi : Some=live / None=mock
+    route ..> menu : clip / gophermaps
+    route ..> gopher_core : builds Entry list
+    Client ..|> SpotifyApi
+    Fake ..|> SpotifyApi
+    Client ..> cache : token + results
+    Client ..> models : serde
+    SpotifyApi ..> Control
+    SpotifyApi ..> models
+```
+
+| Module          | Responsibility                                                                   |
+|-----------------|----------------------------------------------------------------------------------|
+| `main.rs`       | argv dispatch (`root`/`dcgi`/`oauth-init`); MacRoman encode at the stdout edge.  |
+| `dcgi.rs`       | Parse geomyidae's 6 args; route a selector to a gophermap. Pure, fake-testable.  |
+| `spotify.rs`    | `SpotifyApi` trait + response models + the real blocking `ureq` `Client`.        |
+| `cache.rs`      | File-backed TTL cache (token, search 5 min, devices 30 s, playlists 60 s).       |
+| `macroman.rs`   | UTF-8 → Mac OS Roman transcode so TurboGopher renders accents correctly.         |
+| `menu.rs`       | The static root menu, the RFC-1436 66-column clip, the type-`s` `.pls` line.     |
+
+**28 unit tests**, all offline (`cargo test --no-default-features` builds the pure
+core; `cargo test` adds the URL-encoding + device-pick tests).
+
+---
+
+## dcgi routing
+
+geomyidae runs `/srv/spot/index.dcgi` (a one-line wrapper → `gopher-spot dcgi`)
+for *any* non-existent `/spot/*` selector, handing it
+`$search $arguments $host $port $traversal $selector` and reading stdout as a
+gophermap. `route()` dispatches purely on the normalized selector path:
+
+```mermaid
+flowchart LR
+    S([selector]) --> P{path}
+    P -->|"/spot"| ROOT[root menu]
+    P -->|"/spot/now"| NOW[now_playing]
+    P -->|"/spot/search + query"| SR[search → track links]
+    P -->|"/spot/track/{id}"| TR["track detail<br/>+ '>> Tocar agora'"]
+    P -->|"/spot/play?uri="| PL[PUT play on device]
+    P -->|"/spot/control"| CM[control menu]
+    P -->|"/spot/control/*"| CTL["pause / next / prev / vol/N"]
+    P -->|"/spot/playlists"| PLS["playlists, 20/page"]
+    P -->|"/spot/playlists/{id}"| PT["playlist tracks, 20/page"]
+    P -->|"other"| NF[404 gophermap]
+
+    NOW & SR & TR & PL & CTL & PLS & PT --> A{api?}
+    A -->|Some — OAuth Secret present| LIVE[live Spotify data]
+    A -->|None — no Secret| MOCK["Fio B mock menus<br/>(graceful degradation)"]
+
+    style MOCK fill:#5c3a1a,stroke:#d1974f,color:#fff
+    style LIVE fill:#1a5c3a,stroke:#4fd18b,color:#fff
+```
+
+`route()` takes `Option<&dyn SpotifyApi>`: `Some` on the live path, `None` when
+the OAuth Secret is absent — in which case it serves mock menus instead of
+crashing. `/spot/stream.pls` is *not* routed here — it's a **real static file**
+(type-`s`, served verbatim) generated at startup from `$AUDIO_STREAM_URL`, because
+a `.pls` must be served raw, not interpreted as a menu.
+
+---
+
+## Audio delivery: the Icecast fallback
+
+The audio-stream container runs **Icecast**, a persistent streaming server, fed by
+`librespot | ffmpeg`. An earlier `ffmpeg -listen 1` design served exactly one
+client, only while a track was actively producing PCM, and dropped on every
+pause/track-gap — so Audion got "connection refused" most of the time. Icecast
+fixes all three failure modes with a **silence fallback mount**:
+
+```mermaid
+flowchart LR
+    subgraph src["sources (internal, localhost)"]
+        SIL["ffmpeg anullsrc<br/>(always on)"] -->|source| M2["/silence.mp3"]
+        LIVE["librespot | ffmpeg<br/>(only while playing)"] -->|source| M1["/spotify.mp3"]
+    end
+    M1 -. "fallback-mount + fallback-override<br/>(when live source times out)" .-> M2
+    M1 ==>|listeners| AU["Audion :8000/spotify.mp3"]
+    M2 -. fills the gaps .-> AU
+
+    style M1 fill:#1a5c3a,stroke:#4fd18b,color:#fff
+    style M2 fill:#333,stroke:#888,color:#ddd
+```
+
+- **Never refused:** idle → listeners hear `/silence.mp3`; a track → `/spotify.mp3`
+  overrides and snaps them to live audio.
+- **Multi-client:** many listeners off one source.
+- **Survives idle & track changes** via the fallback + a 2 s respawn loop.
+
+Clients still only ever dial `:8000/spotify.mp3`, so nothing changed for the dcgi,
+the `.pls`, or the Service. Image size is ~140 MB (alpine's `ffmpeg` apk alone is
+~30–40 MB of libav*/lame; the `<40 MB` PROMPT target was not chased — LAN pulls
+once).
+
+---
+
+## Design decisions
+
+Answers to the three open questions in [PROMPT.md](PROMPT.md):
 
 1. **librespot: build from source, from the `dev` branch (0.8.0).** No official
    static multi-arch binaries exist, and building lets us `--no-default-features`
    to drop every system audio backend (alsa/pulse/rodio/portaudio/jack) *and*
-   libmdns — the always-compiled pipe backend is all we need. **We build the dev
-   branch, not the 0.6.0 crates.io release:** after a Spotify server-side change
-   (~Nov 2025, [librespot #1623](https://github.com/librespot-org/librespot/issues/1623))
-   0.6.0 can't load any track ("not available in any supported format") — auth
-   works, playback is dead; dev (0.8.0) fixes it. Pinned to `LIBRESPOT_REV`; TLS
-   is rustls-webpki (dev requires an explicit TLS backend). Bump when a fixed
-   release lands.
+   libmdns — the always-compiled pipe backend is all we need. We build **dev, not
+   the 0.6.0 crates.io release**: after a Spotify server-side change (~Nov 2025,
+   [librespot #1623](https://github.com/librespot-org/librespot/issues/1623)) 0.6.0
+   can't load any track ("not available in any supported format") — auth works,
+   playback is dead. Pinned to `LIBRESPOT_REV`; TLS is rustls-webpki (dev requires
+   an explicit TLS backend). Bump when a fixed release lands.
 
 2. **gopher-server: one image.** geomyidae + the dcgi binary in a single image;
-   geomyidae execs the dcgi by `.dcgi` extension + exec bit (the sibling
-   `gopher-askthedeck` pattern). A split Deployment would need a shared
-   filesystem or a network-exec shim for zero real benefit. (Implemented in
-   Fio B.)
+   geomyidae execs the dcgi by `.dcgi` extension + exec bit. A split Deployment
+   would need a shared filesystem or a network-exec shim for zero real benefit.
 
-3. **librespot cache: emptyDir.** A PVC would be RWO and pin the pod to the node
-   holding the volume — directly fighting the "scheduler decides, nothing
-   pinned" constraint. In credentials mode there's nothing worth persisting: on
-   restart the entrypoint re-seeds `credentials.json` from the Secret into the
-   fresh emptyDir, no re-login. emptyDir it is. (See Discovery, below.)
+3. **librespot cache: `emptyDir`.** A PVC would be RWO and pin the pod to one node
+   — directly fighting the "scheduler decides, nothing pinned" constraint. In
+   credentials mode there's nothing worth persisting: on restart the entrypoint
+   re-seeds `credentials.json` from the Secret into the fresh emptyDir, no
+   re-login.
 
-## Discovery — credentials mode (decided)
+### Discovery — credentials mode (not zeroconf)
 
-The PROMPT's Fio A story assumes the pod shows up in the phone's Spotify Connect
-list via **zeroconf** (mDNS). **That can't work from an overlay pod without
-`hostNetwork`** — which is forbidden. mDNS is link-local multicast
-(`224.0.0.251:5353`); it originates in the pod's netns and never crosses the CNI
-boundary onto the LAN, and MetalLB only forwards the one TCP port (`:8000`).
-
-So the deployment runs in **`credentials` mode** (decided): librespot logs into
-Spotify's access point with a cached `credentials.json` and shows up as a Connect
-device *through Spotify's backend*, needing only outbound HTTPS. `LIBRESPOT_MODE`
-selects the mode:
-
-- **`credentials`** — in-cluster default (`deploy/audio-stream.yaml`). Reads
-  `credentials.json` from the `librespot-credentials` Secret (mounted read-only
-  at `/seed`, copied into the writable `/cache` emptyDir by the entrypoint).
-- **`zeroconf`** — local `docker run --network host` testing only; useless from
-  inside the cluster.
-
-### Seeding `librespot-credentials` (one-shot, on a LAN box)
-
-```sh
-# Run librespot locally in zeroconf mode so your phone can see it:
-librespot --name gopher-spot --cache ./c --disable-audio-cache --backend pipe > /dev/null &
-# On the phone: Spotify > Connect > pick "gopher-spot". librespot writes ./c/credentials.json.
-kill %1
-
-# Create the Secret from that file:
-kubectl -n gopher-spot create secret generic librespot-credentials \
-  --from-file=credentials.json=./c/credentials.json
-```
-
-(This is the player identity, distinct from the Web API OAuth Secret in Fio C.
-`deploy/secrets.yaml.template` documents both.)
-
-## Audio delivery: Icecast (not `-listen 1`)
-
-The audio-stream container runs **Icecast**, a persistent streaming server, fed by
-`librespot | ffmpeg`. The earlier `ffmpeg -listen 1` design was too fragile: it
-served exactly one client, only while a track was actively producing PCM, and
-dropped on every pause/track-gap → the client got "connection refused" most of the
-time. Icecast fixes all three:
-
-- **Always up / never refused:** a `/silence.mp3` fallback plays when idle, and
-  `/spotify.mp3` (`fallback-mount=/silence.mp3`, `fallback-override`) snaps to live
-  audio when a track plays. Audion parks on `:8000/spotify.mp3` and stays.
-- **Multi-client:** many listeners off one source.
-- **Survives idle/track changes** via the fallback.
-
-Clients still only dial `:8000/spotify.mp3`, so nothing changed for the dcgi, the
-`.pls`, or the Service.
-
-## Image size note
-
-The audio-stream image is ~140MB — over the PROMPT's `<40MB` target. alpine's
-`ffmpeg` apk alone pulls ~30-40MB of libav*/lame/protocol libs, plus icecast and
-the (fat, tokio/rustls/hyper) librespot binary. Shrinking would mean a hand-built
-minimal static ffmpeg for both arches — a rabbit hole not chased; LAN pulls once.
+The PROMPT assumed the pod shows up in the phone's Spotify Connect list via
+**zeroconf** (mDNS). **That can't work from an overlay pod without `hostNetwork`**
+(forbidden): mDNS is link-local multicast (`224.0.0.251:5353`); it originates in
+the pod's netns and never crosses the CNI boundary onto the LAN, and MetalLB only
+forwards the one TCP port. So the deployment runs in **`credentials` mode**:
+librespot logs into Spotify's access point with a cached `credentials.json` and
+appears as a Connect device *through Spotify's backend*, needing only outbound
+HTTPS. `LIBRESPOT_MODE` selects `credentials` (in-cluster default) vs `zeroconf`
+(local `--network host` testing only).
 
 ---
 
-## Fio A — audio-stream
+## Hard-won gotchas
+
+The things that cost real debugging time — most now live in code comments, all of
+them earned:
+
+| # | Gotcha | Fix |
+|---|--------|-----|
+| 1 | librespot **0.6.0 can't play any track** after a Nov-2025 Spotify change (auth + device OK, zero PCM). | Build the **dev branch (0.8.0)**, pinned rev, `--features rustls-tls-webpki-roots`. |
+| 2 | Spotify `/v1/search` **400s on `limit=20`** ("Invalid limit") despite docs saying 0–50. | `SEARCH_LIMIT=10`. |
+| 3 | Spotify **deprecated `localhost`** in OAuth redirect URIs. | Explicit loopback `http://127.0.0.1:8888/callback`, registered + used identically. |
+| 4 | librespot **zeroconf (mDNS) can't reach the LAN from an overlay pod**. | Credentials mode (see Discovery). |
+| 5 | `ffmpeg -listen 1` gave **"connection refused" on idle**, one client only, dropped on gaps. | Icecast + silence fallback. |
+| 6 | Binding **:70 as non-root** in the pod. | File cap `cap_net_bind_service=+ep` on geomyidae + keep `NET_BIND_SERVICE` in the bounding set + `allowPrivilegeEscalation: true`. |
+| 7 | geomyidae stamps `GOPHER_HOST` into every link; wrong value → **links won't follow** from the Mac. | Set it to the gopher-server LB IP (chicken-and-egg: apply, read IP, re-apply). |
+| 8 | An **in-process cache never survives** — the dcgi is exec'd per request. | File TTL cache in an emptyDir (`cache.rs`). |
+| 9 | Accented names (`Construção`) render as garbage on OS 9 without transcoding. | `macroman::encode` at the stdout edge; ASCII (incl. every `[ ] \| \t \n`) is identity. |
+| 10 | ghcr packages default **private** → `ImagePullBackOff`. | Make packages public (or use the `ghcr-pull` imagePullSecret). |
+
+---
+
+## Build & deploy
+
+Prereqs: `docker buildx` logged into `ghcr.io`, `kubectl` on the cluster, MetalLB
+with a free pool address (pool is `10.0.100.x`).
 
 ```sh
-# 1. build + push multi-arch (needs docker login ghcr.io)
-./scripts/buildx.sh audio
+# ── audio-stream ───────────────────────────────────────────────
+./scripts/buildx.sh audio                       # multi-arch build + push
 
-# 2. check MetalLB has a free pool address BEFORE applying
-kubectl get ipaddresspools -A -n metallb-system
-
-# 3. seed the player credentials Secret (see "Seeding" above) — the pod won't
-#    start without it, since credentials mode mounts it
+# seed the player identity once, on a LAN box with the Spotify app:
+librespot --name gopher-spot --cache ./c --disable-audio-cache --backend pipe >/dev/null &
+#   phone → Spotify → Connect → pick "gopher-spot"; it writes ./c/credentials.json
+kill %1
 kubectl apply -f deploy/namespace.yaml
 kubectl -n gopher-spot create secret generic librespot-credentials \
   --from-file=credentials.json=./c/credentials.json
 
-# 4. apply
 kubectl apply -f deploy/audio-stream.yaml
+kubectl -n gopher-spot get svc audio-stream -o wide   # note the LB IP → :8000
 
-# 5. read the assigned LB IP (if <pending> >60s, describe svc + check MetalLB
-#    BEFORE assuming an app bug — per PROMPT)
-kubectl -n gopher-spot get svc audio-stream -o wide
-
-# 6. transfer playback from the phone to the "gopher-spot" device, then open
-#    http://<lb-ip>:8000/spotify.mp3 in VLC.
-```
-
-Local smoke test without k8s:
-
-```sh
-docker build -f docker/audio-stream.Dockerfile -t gopher-spot-audio .
-docker run --rm --network host -e LIBRESPOT_MODE=zeroconf gopher-spot-audio  # pick from phone
-# open http://localhost:8000/spotify.mp3 in VLC
-```
-
-## Fio B — gopher-server + dcgi skeleton
-
-geomyidae serves `/srv`. Routing (verified against geomyidae's CGI.md):
-
-- `/` → static baked `/srv/index.gph` (the root menu).
-- `/spot/*` → `/srv/spot/index.dcgi` (a one-line wrapper → `gopher-spot dcgi`),
-  which geomyidae runs as the `index.dcgi` fallback for any non-existent path
-  under `/spot`, passing `$search $arguments $host $port $traversal $selector`
-  and interpreting stdout as a gophermap. The dcgi routes on the selector.
-- `/spot/stream.pls` → a **real file** (raw, type-`s`), generated at startup from
-  `$AUDIO_STREAM_URL`. It must be a file, not dcgi output, because a `.pls` is
-  served verbatim, not interpreted as a menu.
-
-Fio B endpoints are mock (no Web API yet). Verified locally with lynx: root menu,
-all `/spot/*` mock routes, the type-7 search passing its query to the dcgi, the
-raw PLS, and the unknown-route fallback all render as clean tabless gophermaps.
-
-```sh
+# ── gopher-server ──────────────────────────────────────────────
 ./scripts/buildx.sh server
-kubectl apply -f deploy/gopher-server.yaml   # ConfigMap + Deployment(2) + Service LB
-kubectl -n gopher-spot get svc gopher-server -o wide
-# then: lynx gopher://<gopher-server-lb-ip>:70/   and validate in TurboGopher (Fio D)
-```
+# set AUDIO_STREAM_URL + GOPHER_HOST in deploy/gopher-server.yaml to the LB IPs
+kubectl apply -f deploy/gopher-server.yaml
+kubectl -n gopher-spot get svc gopher-server -o wide  # note the LB IP → :70
 
-Local smoke test:
-
-```sh
-docker build -f docker/gopher-server.Dockerfile -t gopher-spot-server .
-docker run --rm -p 7070:70 -e AUDIO_STREAM_URL=http://10.0.10.8:8000/spotify.mp3 \
-  -e GOPHER_HOST=127.0.0.1 gopher-spot-server
-lynx gopher://127.0.0.1:7070/1/
-```
-
-Two gotchas worth noting:
-
-- **Privileged port :70 as non-root.** geomyidae carries a file capability
-  (`setcap cap_net_bind_service=+ep`) so `nobody` can bind :70; the Deployment
-  keeps `NET_BIND_SERVICE` in the bounding set and `allowPrivilegeEscalation:
-  true` (required for a file cap to raise).
-- **`GOPHER_HOST`.** geomyidae stamps this into every link's host token. In-
-  cluster it must be the gopher-server LB IP (or `gopher-spot.lan`), else links
-  won't follow from the Mac. Chicken-and-egg: apply once, read the assigned IP,
-  set it in the ConfigMap, re-apply.
-
-### MacRoman note
-
-Fio B display text is all ASCII, so UTF-8 == MacRoman on the wire. Fio C echoes
-Spotify track/artist names (accents, smart quotes), so the whole rendered
-gophermap is transcoded to MacRoman at the IO edge (`macroman::encode` in
-`main.rs`): ASCII — including every structural `[ ] | \t \n` byte — is identity,
-and only accented display bytes are remapped (e.g. `ção` → `8d 8b 6f`, not the
-UTF-8 `c3a7 c3a3`). Unmappable codepoints (CJK, emoji) become `?`.
-
-## Fio C — OAuth + Web API
-
-The dcgi drives the Spotify Web API with **blocking ureq** (a per-request dcgi
-wants no async runtime) against the `gopher-spot` Connect device. `net` is a
-default feature; `cargo test --no-default-features` builds the pure offline core.
-
-Endpoints: `/spot/now` (currently-playing), `/spot/search` (type-7 → tracks as
-`/spot/track/{id}` links + artist/album context), `/spot/track/{id}` (detail +
-`>> Tocar agora` → `/spot/play?uri=...`), `/spot/play?uri=...` (PUT play on the
-device), `/spot/control/{pause,next,prev,vol/N}`.
-
-**Caching is on disk, not "in memory".** A dcgi is exec'd per request, so an
-in-process cache never survives between requests — the PROMPT's "cache em memória"
-is realized as a file TTL cache in `$SPOT_STATE_DIR` (an emptyDir): access token
-(`expires_in − 60s`), search (5 min), devices (30 s). Per-replica, which is fine.
-
-**Graceful degradation.** The `spotify-oauth` Secret is `optional: true` in
-`envFrom`; with no creds the dcgi serves the Fio B mock menus instead of crashing.
-
-### OAuth (one-shot, on a LAN box with a browser)
-
-Set the app's redirect URI to exactly `http://127.0.0.1:8888/callback`, then:
-
-```sh
-SPOTIFY_CLIENT_ID=... SPOTIFY_CLIENT_SECRET=... ./scripts/spotify-oauth-init.sh
-# opens an auth URL, catches the callback on :8888, mints a refresh token,
-# writes deploy/secrets.yaml (gitignored)
-kubectl apply -f deploy/secrets.yaml
+# ── Web API OAuth (one-shot, on a box with a browser) ──────────
+# Register redirect URI http://127.0.0.1:8888/callback in the Spotify dashboard.
+SPOTIFY_CLIENT_ID=… SPOTIFY_CLIENT_SECRET=… ./scripts/spotify-oauth-init.sh
+kubectl apply -f deploy/secrets.yaml              # gitignored
 kubectl rollout restart deployment/gopher-server -n gopher-spot
 ```
 
-Scopes: `user-read-private user-read-playback-state user-modify-playback-state
-user-read-currently-playing playlist-read-private playlist-read-collaborative
-user-library-read`.
-
-**Validation** (needs audio-stream up so the `gopher-spot` device exists): from
-OS 9, Buscar → "chico buarque" → "Construção" → `>> Tocar agora`, hear it in
-Audion (parked on the audio LB bookmark).
-
-## Fio D — playlists + OS 9 validation
-
-`/spot/playlists` (the user's playlists, 20/page) and `/spot/playlists/{id}` (its
-tracks → `/spot/track/{id}` detail → play). Both cached 60s. Pagination is
-`?offset=N` with `<< Pagina anterior` / `>> Proxima pagina` links that appear only
-when the window leaves items on a side. The type-`s` `.pls` reopen item works
-(static file from `AUDIO_STREAM_URL`).
-
-Manual TurboGopher validation is a checklist in
+Without the `spotify-oauth` Secret, the server still starts and serves the mock
+menus (`optional: true` on the `secretRef`). Local smoke tests and the manual
+OS 9 validation checklist live in
 [`scripts/validate-turbogopher.md`](scripts/validate-turbogopher.md) — including a
-recipe to run a local server on the QEMU host's vmnet IP so the OS 9 guest can
-reach it without cluster routing. (The blog post is skipped for now, per the
-maintainer.)
+recipe to run a local server on the QEMU host's vmnet IP so the OS 9 guest reaches
+it without cluster routing.
+
+---
+
+## Build story
+
+Built solo, across **two sittings**, ~10 hours of active work, **14 commits**,
+~1,600 lines of Rust (28 tests) plus Dockerfiles, k8s manifests, and shell.
+
+```mermaid
+gantt
+    title gopher-spot — from empty repo to sound on OS 9
+    dateFormat  YYYY-MM-DD HH:mm
+    axisFormat  %H:%M
+
+    section Session 1 — build it (Jun 30 eve)
+    Fio A  audio-stream pod (librespot｜ffmpeg, LB)   :a1, 2026-06-30 19:42, 21m
+    Fio B  gopher-server + dcgi skeleton              :a2, 2026-06-30 20:03, 107m
+    Fio C  OAuth + Web API (search/control/now)       :a3, 2026-06-30 22:05, 7m
+    Fio D  playlists + OS 9 validation guide          :a4, 2026-06-30 22:12, 66m
+
+    section Session 2 — make audio actually work (Jul 1 morn)
+    Debug  librespot dead → build dev 0.8.0           :b1, 2026-07-01 07:19, 84m
+    Redesign  ffmpeg -listen 1 → Icecast fallback     :b2, 2026-07-01 08:43, 302m
+```
+
+- **Session 1 (Jun 30, ~3.5 h):** the entire thing — both pods, the dcgi, OAuth,
+  the Web API, playlists, MacRoman, 28 tests — went from nothing to committed. The
+  four "fios" (A→D) map one-to-one onto commits. Fast because the shape was clear.
+- **Session 2 (Jul 1, ~6.5 h):** the *hard* part, and only 2 commits to show for
+  it. Audio was "ta quebrado" — control worked, but Audion got connection-refused.
+  Two separate root causes, each a rabbit hole: (1) **librespot 0.6.0 was silently
+  dead** post a Spotify server change — hours ruled out plumbing before pinning the
+  dev branch; (2) `ffmpeg -listen 1` was **too fragile to keep a stream up**,
+  requiring the full **Icecast** redesign. Then it played "Construção" end to end.
+
+The lopsided ratio — features in an evening, one audio bug across a morning — is
+the real lesson: gluing modern SaaS to vintage clients, the protocol translation
+is easy; the **stateful media plane** is where the time goes.
+
+---
+
+## Repo layout
+
+```
+gopher-spot/
+├── README.md                         # this file
+├── PROMPT.md                         # original design brief (pt-BR)
+├── Cargo.toml                        # net feature gates ureq; serde always on
+├── src/
+│   ├── main.rs                       # argv dispatch + MacRoman stdout edge + oauth
+│   ├── lib.rs                        # module root
+│   ├── dcgi.rs                       # selector → gophermap routing (fake-testable)
+│   ├── spotify.rs                    # SpotifyApi trait + models + blocking Client
+│   ├── cache.rs                      # file-backed TTL cache
+│   ├── macroman.rs                   # UTF-8 → Mac OS Roman
+│   └── menu.rs                       # root menu, 66-col clip, type-s .pls line
+├── docker/
+│   ├── audio-stream.Dockerfile       # librespot(dev) + ffmpeg + icecast, multi-arch
+│   ├── audio-stream-entrypoint.sh    # the Icecast + silence-fallback pipeline
+│   ├── gopher-server.Dockerfile      # geomyidae(src) + dcgi, musl static, :70 cap
+│   └── gopher-server-entrypoint.sh   # renders stream.pls, execs geomyidae
+├── deploy/
+│   ├── namespace.yaml
+│   ├── audio-stream.yaml             # Deployment(1, Recreate) + Service LB
+│   ├── gopher-server.yaml            # ConfigMap + Deployment(2) + Service LB
+│   ├── secrets.yaml.template         # Web API OAuth (secrets.yaml is gitignored)
+│   └── kustomization.yaml
+└── scripts/
+    ├── buildx.sh                     # multi-arch build + push
+    ├── spotify-oauth-init.sh         # one-shot OAuth → deploy/secrets.yaml
+    └── validate-turbogopher.md       # manual OS 9 validation checklist
+```
+
+### Non-goals
+
+No VPS (`gopher.debene.dev` is untouched), no Spotify reimplementation (librespot
+does Connect), no GUI anywhere but Gopher, no Spotify Free (Premium only), no
+gapless, no cover art, no public exposure. LAN-only, by design.

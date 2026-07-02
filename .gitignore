@@ -16,3 +16,8 @@ credentials.json
 
 # OS junk
 .DS_Store
+
+# Blog post — intentionally untracked (write-up, not source)
+/post.md
+# Audio debugging artifacts
+*.mp3
