@@ -875,6 +875,9 @@ mod tests {
         fn play(&self, _uri: &str) -> Result<(), ApiError> {
             Ok(())
         }
+        fn wake(&self, _play: bool) -> Result<(), ApiError> {
+            Ok(())
+        }
         fn control(&self, _cmd: Control) -> Result<(), ApiError> {
             Ok(())
         }

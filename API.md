@@ -55,6 +55,7 @@ Returns a **snapshot**:
 | `track_id`    | track loaded | Spotify track id                                  |
 | `position_ms` | track loaded | playback position at snapshot time (int, ms)      |
 | `duration_ms` | track loaded | track length (int, ms)                            |
+| `device`      | always       | `active` \| `idle` — see below (added in fio S3/3) |
 | `volume`      | device known | active device volume, `0`–`100`                   |
 | `queue_len`   | always       | number of queued tracks (best-effort; `0` if n/a) |
 | `ts`          | always       | unix epoch **ms** when the dcgi took the snapshot  |
@@ -66,6 +67,20 @@ loaded); `album_id` is omitted when the current item carries no album uri;
 
 `ts` exists so the client can **interpolate the progress bar between polls**:
 `estimated_position = position_ms + (now − ts)` while `state == playing`.
+
+**`device`** (always present) tells whether the account's current player *is* the
+gopher-spot librespot device — the one the audio stream (`:8000/spotify.mp3`)
+actually carries:
+
+- `active` — gopher-spot is the current player. What `/now` reports is what the
+  audio stream is playing.
+- `idle` — gopher-spot is **not** the current player: playback is on another
+  device (phone/desktop), or nothing is playing / no active device at all. The
+  `state`/`track` fields may still be populated (they reflect the account's
+  playback wherever it is), but the **audio stream won't carry it**. Recover with
+  `wake` (below). With the fio S3/1 audio drainer, `idle` is now uncommon — it
+  means a real handoff to another device or a librespot crash, not merely "nobody
+  is listening".
 
 Example (`printf '/spot/api/1/now\r\n' | nc <lb> 70`):
 
@@ -105,6 +120,28 @@ leaves with fresh state in one round-trip.
 - Commands are **idempotent** where it makes sense: `play` while already playing
   (and `pause` while already paused) returns a snapshot, **not** an error — even
   though Spotify itself 403s "Restriction violated" in that case, which we swallow.
+
+### Wake (added in fio S3/3)
+
+```
+/spot/api/1/wake
+/spot/api/1/wake?play=1
+```
+
+**Transfer playback to the gopher-spot device** (`PUT /v1/me/player` with
+`device_ids`). This is how a client turns a `device idle` `/now` back into
+`device active`: playback that drifted to the phone (or was lost to a librespot
+crash) is pulled back onto the device the audio stream carries.
+
+- Bare `wake` transfers **without** changing the play/pause state.
+- `wake?play=1` also **resumes** playback on transfer (the Web API's native
+  `play` boolean). A client that finds `device idle` and wants to hear audio
+  should call `wake?play=1`.
+
+Returns the fresh **`/now`** snapshot (convention; subject to the same eventual
+consistency note — the returned snapshot may still show `device idle` for ~1–2 s
+before Spotify settles). If the gopher-spot device isn't registered (librespot is
+down), returns `no_device`.
 
 ### Queue (added in fio S2)
 
@@ -179,8 +216,9 @@ error	<short code>
 message	<english description>
 ```
 
-Codes: `bad_range`, `bad_uri`, `no_track`, `not_found`, `upstream` (a
-Spotify/transport failure, or the OAuth Secret not being configured). `message`
+Codes: `bad_range`, `bad_uri`, `no_track`, `no_device` (fio S3/3: `wake` found no
+registered gopher-spot device), `not_found`, `upstream` (a Spotify/transport
+failure, or the OAuth Secret not being configured). `message`
 is human-readable English and **not** part of the stable contract — switch on
 `error`, not on text.
 

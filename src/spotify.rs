@@ -219,6 +219,12 @@ pub trait SpotifyApi {
     fn track(&self, id: &str) -> Result<Track, ApiError>;
     /// Start playback of a URI on the `gopher-spot` device.
     fn play(&self, uri: &str) -> Result<(), ApiError>;
+    /// Transfer playback to the `gopher-spot` device (`PUT /v1/me/player`). `play`
+    /// resumes playback on transfer; `false` transfers without changing the
+    /// play/pause state. If the `gopher-spot` device isn't registered (librespot
+    /// down), the error message carries `no_device` so the API maps it to that
+    /// code rather than a generic `upstream`.
+    fn wake(&self, play: bool) -> Result<(), ApiError>;
     fn control(&self, cmd: Control) -> Result<(), ApiError>;
     /// Seek the current track to `position_ms` (`PUT /v1/me/player/seek`). The
     /// caller clamps to the track duration; this just issues the command.
@@ -492,6 +498,26 @@ mod net {
             let devices: Devices = serde_json::from_str(&body).map_err(|e| e.to_string())?;
             pick_device(&devices.devices)
         }
+
+        /// The `gopher-spot` device id, fetched FRESH (uncached) — wake decides
+        /// registration from it, and a 30 s-stale device list could report a
+        /// librespot that has since gone down (or miss one that just came up). The
+        /// fresh body reseeds the `devices` cache the play path reuses. Returns a
+        /// `no_device`-tagged error when the device isn't registered.
+        fn gopher_device_id_fresh(&self) -> Result<String, ApiError> {
+            let body = self
+                .get("/v1/me/player/devices")?
+                .into_string()
+                .map_err(|e| e.to_string())?;
+            cache::put(&self.state_dir, "devices", self.now_unix, DEVICES_TTL, &body);
+            let devices: Devices = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+            devices
+                .devices
+                .iter()
+                .find(|d| d.name == DEVICE_NAME)
+                .and_then(|d| d.id.clone())
+                .ok_or_else(|| format!("no_device: '{DEVICE_NAME}' is not registered"))
+        }
     }
 
     impl SpotifyApi for Client {
@@ -605,6 +631,21 @@ mod net {
             .to_string();
             self.agent
                 .put(&format!("{API}/v1/me/player/play?device_id={device}"))
+                .set("Authorization", &format!("Bearer {token}"))
+                .set("Content-Type", "application/json")
+                .send_string(&body)
+                .map(|_| ())
+                .map_err(api_err)
+        }
+
+        fn wake(&self, play: bool) -> Result<(), ApiError> {
+            // Transfer playback to gopher-spot. device_ids selects the target; the
+            // `play` boolean is the Web API's native "resume on transfer" flag.
+            let device = self.gopher_device_id_fresh()?;
+            let token = self.access_token()?;
+            let body = serde_json::json!({ "device_ids": [device], "play": play }).to_string();
+            self.agent
+                .put(&format!("{API}/v1/me/player"))
                 .set("Authorization", &format!("Bearer {token}"))
                 .set("Content-Type", "application/json")
                 .send_string(&body)

@@ -62,6 +62,7 @@ pub fn route(path: &str, args: &DcgiArgs, api: Option<&dyn SpotifyApi>, now_ms: 
         "seek" => seek(api, args, now_ms),
         "queue" => queue_doc(api, now_ms),
         "queue/add" => queue_add(api, args, now_ms),
+        "wake" => wake(api, args, now_ms),
         other => error("not_found", &format!("unknown endpoint: {other}")),
     };
     text.into_bytes()
@@ -163,6 +164,24 @@ fn seek(api: &dyn SpotifyApi, args: &DcgiArgs, now_ms: i64) -> String {
     }
 }
 
+/// `/wake[?play=1]`: transfer playback to the gopher-spot device. `?play=1` also
+/// resumes on transfer (the Web API's native flag); without it, playback is
+/// transferred in whatever play/pause state it was. Returns a fresh `/now`
+/// snapshot (convention). The gopher-spot device not being registered (librespot
+/// down) -> `no_device`.
+fn wake(api: &dyn SpotifyApi, args: &DcgiArgs, now_ms: i64) -> String {
+    let play = args.query("play").as_deref() == Some("1");
+    match api.wake(play) {
+        // wake is a command: fresh_now busts the micro-cache so the transfer is
+        // reflected immediately (fio S3/2 synergy).
+        Ok(()) => fresh_now(api, now_ms),
+        Err(e) if e.contains("no_device") => {
+            error("no_device", "gopher-spot device is not registered")
+        }
+        Err(e) => error("upstream", &e),
+    }
+}
+
 /// Run a play/pause/next/prev command, then reply with a fresh snapshot. For the
 /// idempotent pair (`play`/`pause`), Spotify 403s "Restriction violated" when the
 /// player is already in the requested state — swallow that and return the
@@ -244,6 +263,15 @@ fn snapshot(p: &Playing, queue_len: usize, now_ms: i64) -> String {
         kv(&mut out, "position_ms", &p.progress_ms.to_string());
         kv(&mut out, "duration_ms", &t.duration_ms.to_string());
     }
+    // device (fio S3/3): `active` iff the account's current player IS the
+    // gopher-spot librespot device — the one the audio stream carries. Anything
+    // else (playing on the phone, or no active device) is `idle`, the case the
+    // `wake` endpoint recovers from. Always present; the client keys off it.
+    let device = match &p.device {
+        Some(d) if d.name == "gopher-spot" => "active",
+        _ => "idle",
+    };
+    kv(&mut out, "device", device);
     if let Some(vol) = p.device.as_ref().and_then(|d| d.volume_percent) {
         kv(&mut out, "volume", &vol.to_string());
     }
@@ -362,6 +390,10 @@ mod tests {
         // poll burst folds to one fetch and a command busts it.
         now_calls: RefCell<u32>,
         now_cache: RefCell<Option<(i64, String)>>,
+        // fio S3/3 wake: `no_device` simulates librespot being unregistered;
+        // `last_wake` records the play flag the endpoint passed.
+        no_device: bool,
+        last_wake: RefCell<Option<bool>>,
     }
     fn fake(playing: Playing) -> Fake {
         Fake {
@@ -373,6 +405,8 @@ mod tests {
             last_queued: RefCell::new(None),
             now_calls: RefCell::new(0),
             now_cache: RefCell::new(None),
+            no_device: false,
+            last_wake: RefCell::new(None),
         }
     }
     fn playing_track() -> Playing {
@@ -455,6 +489,13 @@ mod tests {
         fn play(&self, _uri: &str) -> Result<(), ApiError> {
             unimplemented!()
         }
+        fn wake(&self, play: bool) -> Result<(), ApiError> {
+            if self.no_device {
+                return Err("no_device: 'gopher-spot' is not registered".into());
+            }
+            *self.last_wake.borrow_mut() = Some(play);
+            Ok(())
+        }
         fn playlists(&self, _o: u32) -> Result<PlaylistsPage, ApiError> {
             unimplemented!()
         }
@@ -519,6 +560,7 @@ mod tests {
         assert!(out.contains("track_id\tabc123\r\n"));
         assert!(out.contains("position_ms\t42000\r\n"));
         assert!(out.contains("duration_ms\t380000\r\n"));
+        assert!(out.contains("device\tactive\r\n")); // active device is gopher-spot
         assert!(out.contains("volume\t65\r\n"));
         assert!(out.contains("queue_len\t2\r\n"));
         assert!(out.contains(&format!("ts\t{TS}\r\n")));
@@ -531,6 +573,7 @@ mod tests {
         assert_wire(&out);
         assert!(out.contains("state\tstopped\r\n"));
         assert!(!out.contains("track\t"));
+        assert!(out.contains("device\tidle\r\n")); // no active device -> idle
         assert!(!out.contains("volume\t")); // no device
         assert!(out.contains("queue_len\t"));
         assert!(out.contains("ts\t"));
@@ -794,6 +837,59 @@ mod tests {
         now_at(&f, TS); // caches /now
         call(&f, "/spot/api/1/queue/add?spotify:track:xyz"); // must invalidate
         now_at(&f, TS + 100); // would be a stale hit if not invalidated -> fetch
+        assert_eq!(*f.now_calls.borrow(), 2);
+    }
+
+    // ---- fio S3/3: device + wake ----------------------------------------------
+
+    #[test]
+    fn device_idle_when_playing_elsewhere() {
+        // Active device is the phone, not gopher-spot -> device idle (even though
+        // a track is playing).
+        let mut p = playing_track();
+        p.device = Some(Device {
+            id: Some("phone".into()),
+            name: "iPhone".into(),
+            is_active: true,
+            volume_percent: Some(40),
+        });
+        let out = call(&fake(p), "/spot/api/1/now");
+        assert!(out.contains("device\tidle\r\n"));
+        assert!(out.contains("state\tplaying\r\n")); // still playing, just elsewhere
+    }
+
+    #[test]
+    fn wake_transfers_without_play_and_returns_now() {
+        let f = fake(playing_track());
+        let out = call(&f, "/spot/api/1/wake");
+        assert_eq!(*f.last_wake.borrow(), Some(false)); // no ?play -> transfer only
+        assert!(!out.contains("error\t"));
+        assert!(out.contains("state\t")); // a /now snapshot, per convention
+        assert!(out.contains("device\t"));
+    }
+
+    #[test]
+    fn wake_play_1_resumes_on_transfer() {
+        let f = fake(playing_track());
+        call(&f, "/spot/api/1/wake?play=1");
+        assert_eq!(*f.last_wake.borrow(), Some(true));
+    }
+
+    #[test]
+    fn wake_no_device_is_no_device_error() {
+        let f = Fake {
+            no_device: true,
+            ..fake(playing_track())
+        };
+        let out = call(&f, "/spot/api/1/wake");
+        assert!(out.contains("error\tno_device\r\n"));
+    }
+
+    #[test]
+    fn wake_busts_now_cache() {
+        let f = fake(playing_track());
+        now_at(&f, TS); // caches /now
+        call(&f, "/spot/api/1/wake"); // command -> must invalidate + refetch
         assert_eq!(*f.now_calls.borrow(), 2);
     }
 }
