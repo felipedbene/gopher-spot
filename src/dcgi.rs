@@ -102,12 +102,11 @@ impl DcgiArgs {
 /// request wall-clock (unix ms), used as the API snapshot `ts`.
 pub fn route(args: &DcgiArgs, api: Option<&dyn SpotifyApi>, now_ms: i64) -> String {
     let path = args.path();
-    // The machine API is a separate, frozen contract (fio S1). geomyidae routes
-    // it through /srv/spot/api/index.cgi (raw), never this .dcgi — but we still
-    // dispatch it here so the one binary handles both shapes and stays testable.
-    if path == "/spot/api" || path.starts_with("/spot/api/") {
-        return crate::api::route(&path, args, api, now_ms);
-    }
+    // The machine API is a separate, frozen contract (fio S1/S2) served RAW (it
+    // can return binary cover bytes), so `main.rs` dispatches `/spot/api/*`
+    // straight to `api::route` (-> Vec<u8>) and never reaches this gophermap
+    // router. `now_ms` is still threaded through for the human menus below.
+    let _ = now_ms;
     match path.as_str() {
         // The section root serves the same menu as the baked /srv/index.gph.
         "" | "/" | "/spot" => menu::root_gph(),
@@ -827,6 +826,12 @@ mod tests {
             Ok(self.playing.clone())
         }
         fn queue(&self) -> Result<Vec<Track>, ApiError> {
+            Ok(Vec::new())
+        }
+        fn queue_add(&self, _uri: &str) -> Result<(), ApiError> {
+            Ok(())
+        }
+        fn album_cover(&self, _album_id: &str, _want_px: u32) -> Result<Vec<u8>, ApiError> {
             Ok(Vec::new())
         }
         fn search(&self, q: &str) -> Result<SearchResults, ApiError> {

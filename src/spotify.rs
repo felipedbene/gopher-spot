@@ -43,6 +43,19 @@ pub struct Album {
     pub uri: String,
 }
 
+/// One entry of an album's `images` array (`GET /v1/albums/{id}`). Spotify serves
+/// a few fixed sizes (canonically 640/300/64 px, largest first) from its CDN.
+/// `height`/`width` can be absent, so they're optional; the cover picker treats a
+/// missing dimension as 0 (smaller than any request).
+#[derive(Debug, Clone, Deserialize)]
+pub struct Image {
+    pub url: String,
+    #[serde(default)]
+    pub height: Option<u32>,
+    #[serde(default)]
+    pub width: Option<u32>,
+}
+
 /// A track (subset we render). `uri` drives playback; `id` builds detail links.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Track {
@@ -157,6 +170,24 @@ pub struct AlbumsPage {
     pub offset: u32,
 }
 
+/// The pixel dimension of an image (height, else width, else 0 when Spotify
+/// omits both).
+fn image_dim(i: &Image) -> u32 {
+    i.height.or(i.width).unwrap_or(0)
+}
+
+/// Pick the album image to serve for a requested size: the smallest image at
+/// least as large as `want_px` (so we never upscale a thumbnail), falling back to
+/// the largest available when every image is smaller than the request. `None`
+/// only when there are no images at all.
+pub fn pick_image(images: &[Image], want_px: u32) -> Option<&Image> {
+    images
+        .iter()
+        .filter(|i| image_dim(i) >= want_px)
+        .min_by_key(|i| image_dim(i))
+        .or_else(|| images.iter().max_by_key(|i| image_dim(i)))
+}
+
 /// Extract the trailing id from a `spotify:kind:ID` uri. `None` for empty or
 /// malformed input (so callers fall back to a plain, non-clickable line).
 pub fn id_from_uri(uri: &str) -> Option<&str> {
@@ -175,6 +206,15 @@ pub trait SpotifyApi {
     /// The upcoming queue (`/v1/me/player/queue`). Empty when nothing is queued —
     /// which is what "no more tracks left in queue" looks like to the user.
     fn queue(&self) -> Result<Vec<Track>, ApiError>;
+    /// Enqueue a track uri (`POST /v1/me/player/queue`). The caller validates the
+    /// uri shape; this just issues the command against the gopher-spot device.
+    fn queue_add(&self, uri: &str) -> Result<(), ApiError>;
+    /// The album cover JPEG for `album_id` at the size closest to `want_px`
+    /// (smallest image ≥ requested, else the largest available). Bytes are cached
+    /// on disk (covers are immutable). Errors carry `HTTP 404` for an unknown
+    /// album and `no cover` when the album has no images — the API layer maps both
+    /// to `not_found`.
+    fn album_cover(&self, album_id: &str, want_px: u32) -> Result<Vec<u8>, ApiError>;
     fn search(&self, query: &str) -> Result<SearchResults, ApiError>;
     fn track(&self, id: &str) -> Result<Track, ApiError>;
     /// Start playback of a URI on the `gopher-spot` device.
@@ -208,6 +248,7 @@ pub use net::Client;
 mod net {
     use super::*;
     use crate::cache;
+    use std::io::Read;
     use std::path::PathBuf;
 
     const API: &str = "https://api.spotify.com";
@@ -247,6 +288,10 @@ mod net {
         uri: String,
         #[serde(default)]
         artists: Vec<Artist>,
+        // The cover images (fio S2). Parsed from the SAME cached album body the
+        // human album page fetches, so a cover costs no extra Spotify call.
+        #[serde(default = "Vec::new")]
+        images: Vec<Image>,
         tracks: RawAlbumTracks,
     }
 
@@ -384,6 +429,18 @@ mod net {
             res.map(|_| ()).map_err(api_err)
         }
 
+        /// Download raw bytes from a full URL (a Spotify CDN image — public, so no
+        /// Authorization header). Reads the whole body into memory; cover JPEGs are
+        /// a few tens of KB.
+        fn download(&self, url: &str) -> Result<Vec<u8>, ApiError> {
+            let resp = self.agent.get(url).call().map_err(api_err)?;
+            let mut buf = Vec::new();
+            resp.into_reader()
+                .read_to_end(&mut buf)
+                .map_err(|e| format!("cover download read failed: {e}"))?;
+            Ok(buf)
+        }
+
         /// GET `path` with the disk cache in front (TTL seconds), returning the
         /// raw JSON body.
         fn get_cached(&self, key: &str, ttl: i64, path: &str) -> Result<String, ApiError> {
@@ -445,6 +502,50 @@ mod net {
                 .into_json()
                 .map_err(|e| format!("queue parse failed: {e}"))?;
             Ok(q.queue)
+        }
+
+        fn queue_add(&self, uri: &str) -> Result<(), ApiError> {
+            // Target the gopher-spot device explicitly (like `play`) so the item
+            // lands on the librespot player the audio stream carries. A body-less
+            // POST 411s (see `command`), so route through `command` which sends an
+            // explicit empty body.
+            let device = self.device_id()?;
+            self.command(
+                "POST",
+                &format!(
+                    "/v1/me/player/queue?uri={}&device_id={device}",
+                    urlencode(uri)
+                ),
+            )
+        }
+
+        fn album_cover(&self, album_id: &str, want_px: u32) -> Result<Vec<u8>, ApiError> {
+            // Reuse the album JSON the human album page already caches (24h) — the
+            // cover URLs live there, so no extra catalog call.
+            let body = self.get_cached(
+                &format!("album:{album_id}"),
+                CATALOG_TTL,
+                &format!("/v1/albums/{album_id}"),
+            )?;
+            let raw: RawAlbum = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+            let img = pick_image(&raw.images, want_px)
+                .ok_or_else(|| format!("no cover image for album {album_id}"))?;
+            // Key the byte cache by the CHOSEN pixel size, not the request: two
+            // requested sizes that resolve to the same CDN image share one entry, so
+            // we download each distinct cover at most once.
+            let picked = image_dim(img);
+            let ckey = format!("cover:{album_id}:{picked}");
+            if let Some(b) = cache::get_bytes(&self.state_dir, &ckey, self.now_unix) {
+                return Ok(b);
+            }
+            // A cache miss is the only path that hits Spotify's CDN. Do NOT log it to
+            // stderr: geomyidae's handlecgi splices the child's stderr into the
+            // client socket, so any stray byte here would prepend to and corrupt the
+            // JPEG. The cache is observable without a log — via the file that appears
+            // under the state dir and the miss-vs-hit latency gap.
+            let bytes = self.download(&img.url)?;
+            cache::put_bytes(&self.state_dir, &ckey, self.now_unix, CATALOG_TTL, &bytes);
+            Ok(bytes)
         }
 
         fn search(&self, query: &str) -> Result<SearchResults, ApiError> {
@@ -733,6 +834,25 @@ mod tests {
         assert_eq!(id_from_uri(""), None);
         assert_eq!(id_from_uri("nope"), None);
         assert_eq!(id_from_uri("spotify:album:"), None);
+    }
+
+    #[test]
+    fn pick_image_prefers_smallest_ge_then_largest() {
+        let imgs = vec![
+            Image { url: "big".into(), height: Some(640), width: Some(640) },
+            Image { url: "mid".into(), height: Some(300), width: Some(300) },
+            Image { url: "sm".into(), height: Some(64), width: Some(64) },
+        ];
+        // exact / smallest-at-least matches
+        assert_eq!(pick_image(&imgs, 64).unwrap().url, "sm");
+        assert_eq!(pick_image(&imgs, 300).unwrap().url, "mid");
+        assert_eq!(pick_image(&imgs, 640).unwrap().url, "big");
+        // between sizes rounds UP to the next available
+        assert_eq!(pick_image(&imgs, 65).unwrap().url, "mid");
+        // larger than everything -> largest available (fallback)
+        assert_eq!(pick_image(&imgs, 1000).unwrap().url, "big");
+        // no images -> None
+        assert!(pick_image(&[], 64).is_none());
     }
 
     #[test]

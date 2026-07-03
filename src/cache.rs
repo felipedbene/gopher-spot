@@ -7,7 +7,8 @@
 //! pod). Per-replica, which is fine: the caches just warm independently.
 //!
 //! Used for the access token (TTL = expires_in - slack), search (5 min), devices
-//! (30 s), and playlists (60 s, Fio D).
+//! (30 s), playlists (60 s, Fio D), and — via the byte-safe variants below —
+//! album cover JPEGs (fio S2), whose raw bytes are not valid UTF-8.
 
 use std::path::{Path, PathBuf};
 
@@ -40,6 +41,28 @@ pub fn put(dir: &Path, key: &str, now_unix: i64, ttl_secs: i64, payload: &str) {
         key_file(dir, key),
         format!("{}\n{}", now_unix + ttl_secs, payload),
     );
+}
+
+/// Byte-safe read: return the cached raw payload for `key` if present and unexpired.
+/// Same `expiry\npayload` framing as [`get`], but the payload may be arbitrary
+/// bytes (a JPEG cover), so we never go through `String`. The expiry prefix is
+/// always ASCII digits, so splitting on the first `\n` byte is unambiguous.
+pub fn get_bytes(dir: &Path, key: &str, now_unix: i64) -> Option<Vec<u8>> {
+    let data = std::fs::read(key_file(dir, key)).ok()?;
+    let nl = data.iter().position(|&b| b == b'\n')?;
+    let exp: i64 = std::str::from_utf8(&data[..nl]).ok()?.trim().parse().ok()?;
+    if now_unix >= exp {
+        return None;
+    }
+    Some(data[nl + 1..].to_vec())
+}
+
+/// Byte-safe store: like [`put`], but for a raw byte payload. Best-effort.
+pub fn put_bytes(dir: &Path, key: &str, now_unix: i64, ttl_secs: i64, payload: &[u8]) {
+    let _ = std::fs::create_dir_all(dir);
+    let mut buf = format!("{}\n", now_unix + ttl_secs).into_bytes();
+    buf.extend_from_slice(payload);
+    let _ = std::fs::write(key_file(dir, key), buf);
 }
 
 #[cfg(test)]
@@ -80,5 +103,17 @@ mod tests {
         let body = "line1\nline2\nline3";
         put(&d, "k", 0, 100, body);
         assert_eq!(get(&d, "k", 1), Some(body.into()));
+    }
+
+    #[test]
+    fn bytes_round_trip_including_non_utf8() {
+        let d = tmp("bytes");
+        // JPEG SOI + a byte that is invalid UTF-8 (0xFF) + an embedded newline,
+        // to prove the cover cache is byte-exact and framing-safe.
+        let jpeg = [0xFFu8, 0xD8, 0xFF, 0xE0, b'\n', 0x00, 0xFF, 0xD9];
+        put_bytes(&d, "cover:al1:640", 1000, 86_400, &jpeg);
+        assert_eq!(get_bytes(&d, "cover:al1:640", 1000), Some(jpeg.to_vec()));
+        assert_eq!(get_bytes(&d, "cover:al1:640", 87_401), None); // expired
+        assert_eq!(get_bytes(&d, "never", 0), None);
     }
 }

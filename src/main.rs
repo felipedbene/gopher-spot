@@ -17,6 +17,13 @@ use std::process::ExitCode;
 
 use gopher_spot::{dcgi, latin1, macroman, menu};
 
+/// A rendered dcgi response: a human gophermap (transcoded at the edge) or the
+/// machine API's raw bytes (written verbatim — see `run_dcgi`).
+enum DcgiOut {
+    Menu(String),
+    Api(Vec<u8>),
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
@@ -25,16 +32,16 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("dcgi") => {
-            let (body, is_api) = run_dcgi(&args[2..]);
-            if is_api {
-                // The machine API is a type-0 text document of `key<TAB>value`
-                // lines in UTF-8, served RAW by geomyidae's .cgi (verbatim to the
-                // socket). It must NOT get the human menus' Latin-1 transcode — that
-                // would corrupt non-Latin-1 names and is the wrong charset for the
-                // contract — and its tabs must survive. So write the bytes as-is.
-                let _ = std::io::stdout().write_all(body.as_bytes());
-            } else {
-                emit(&body);
+            match run_dcgi(&args[2..]) {
+                // The machine API is served RAW by geomyidae's .cgi (verbatim to
+                // the socket): tab-delimited UTF-8 text OR binary cover JPEG. It
+                // must NOT get the human menus' Latin-1 transcode — that would
+                // corrupt the bytes and is the wrong charset for the contract — and
+                // its tabs/binary must survive. So write the bytes as-is.
+                DcgiOut::Api(bytes) => {
+                    let _ = std::io::stdout().write_all(&bytes);
+                }
+                DcgiOut::Menu(body) => emit(&body),
             }
             ExitCode::SUCCESS
         }
@@ -59,30 +66,39 @@ fn emit(gph: &str) {
     let _ = std::io::stdout().write_all(&bytes);
 }
 
-/// Route a dcgi request, returning `(body, is_api)`. `is_api` selects the output
-/// encoding at the stdout edge: `/spot/api/*` is raw UTF-8 (tab-delimited type-0),
-/// everything else is a transcoded gophermap. On the `net` build we try to build a
-/// live Spotify client from the OAuth env (the Secret); if it's absent, `route`
-/// gets `None` and serves the offline mock menus.
-fn run_dcgi(rest: &[String]) -> (String, bool) {
+/// Route a dcgi request. `/spot/api/*` goes to the machine API (`api::route`,
+/// raw bytes — tab-delimited UTF-8 or a binary cover); everything else renders a
+/// human gophermap (`dcgi::route`, transcoded at the stdout edge). On the `net`
+/// build we try to build a live Spotify client from the OAuth env (the Secret);
+/// if it's absent, both routes get `None` and serve the offline mock/contract.
+fn run_dcgi(rest: &[String]) -> DcgiOut {
     let a = dcgi::DcgiArgs::from_argv(rest);
     let path = a.path();
     let is_api = path == "/spot/api" || path.starts_with("/spot/api/");
     let now_ms = now_unix_ms();
 
     #[cfg(feature = "net")]
-    let body = {
+    {
         use gopher_spot::spotify::{Client, SpotifyApi};
         let state =
             std::env::var("SPOT_STATE_DIR").unwrap_or_else(|_| "/var/cache/spot".to_string());
         let client = Client::from_env(now_ms / 1000, std::path::PathBuf::from(state));
-        dcgi::route(&a, client.as_ref().map(|c| c as &dyn SpotifyApi), now_ms)
-    };
+        let api = client.as_ref().map(|c| c as &dyn SpotifyApi);
+        if is_api {
+            DcgiOut::Api(gopher_spot::api::route(&path, &a, api, now_ms))
+        } else {
+            DcgiOut::Menu(dcgi::route(&a, api, now_ms))
+        }
+    }
 
     #[cfg(not(feature = "net"))]
-    let body = dcgi::route(&a, None, now_ms);
-
-    (body, is_api)
+    {
+        if is_api {
+            DcgiOut::Api(gopher_spot::api::route(&path, &a, None, now_ms))
+        } else {
+            DcgiOut::Menu(dcgi::route(&a, None, now_ms))
+        }
+    }
 }
 
 /// Wall-clock as unix epoch milliseconds — the API snapshot `ts` (and, /1000, the

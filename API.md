@@ -51,6 +51,7 @@ Returns a **snapshot**:
 | `track`       | track loaded | track name                                        |
 | `artist`      | track loaded | artist name(s), joined with `, `                  |
 | `album`       | track loaded | album name                                        |
+| `album_id`    | album known  | Spotify album id — feed it to `/cover/<id>/<size>`|
 | `track_id`    | track loaded | Spotify track id                                  |
 | `position_ms` | track loaded | playback position at snapshot time (int, ms)      |
 | `duration_ms` | track loaded | track length (int, ms)                            |
@@ -59,7 +60,8 @@ Returns a **snapshot**:
 | `ts`          | always       | unix epoch **ms** when the dcgi took the snapshot  |
 
 The `track…duration_ms` keys are omitted when `state` is `stopped` (nothing
-loaded); `volume` is omitted when no active device reports one. A client keys off
+loaded); `album_id` is omitted when the current item carries no album uri;
+`volume` is omitted when no active device reports one. A client keys off
 `state` first.
 
 `ts` exists so the client can **interpolate the progress bar between polls**:
@@ -104,6 +106,71 @@ leaves with fresh state in one round-trip.
   (and `pause` while already paused) returns a snapshot, **not** an error — even
   though Spotify itself 403s "Restriction violated" in that case, which we swallow.
 
+### Queue (added in fio S2)
+
+```
+/spot/api/1/queue
+```
+
+The upcoming tracks, in the order they will play, as indexed `item.<i>.*` keys
+(`<i>` from `0`). Flattening the list into keys keeps the wire invariant — exactly
+one TAB per line.
+
+| key                  | when         | value                                    |
+|----------------------|--------------|------------------------------------------|
+| `api`                | always       | `1`                                      |
+| `queue_len`          | always       | number of upcoming tracks (`0` if empty) |
+| `item.<i>.uri`       | per item     | `spotify:track:<id>`                     |
+| `item.<i>.track`     | per item     | track name                               |
+| `item.<i>.artist`    | per item     | artist name(s), joined with `, `         |
+| `item.<i>.album_id`  | album known  | Spotify album id (for `/cover`)          |
+| `item.<i>.duration_ms`| per item    | track length (int, ms)                   |
+| `ts`                 | always       | unix epoch **ms** at snapshot time        |
+
+An **empty queue** is just `queue_len` `0` with no `item.*` lines. `item.<i>.album_id`
+is omitted for an item whose album carries no uri.
+
+```
+/spot/api/1/queue/add?<uri>
+```
+
+Enqueues `<uri>` (the bare argument after `?`, e.g. `queue/add?spotify:track:4iV5W9…`)
+on the gopher-spot device, then returns the fresh **`/queue`** snapshot — the
+document the client's playlist redraws (not `/now`). A non-track or malformed uri
+→ `bad_uri`.
+
+> **Eventual consistency.** Like every command, the returned snapshot reflects what
+> Spotify reports *at that instant*; the just-added item may not appear for ~1–2 s.
+> The add **did** take effect — the client re-polls `/queue`.
+
+There is **no** `queue/clear`: the Spotify Web API exposes no endpoint to remove
+from or clear the queue (only add). It is deliberately absent from v1; if Spotify
+ever adds one it can be added additively. We do **not** emulate it with chained
+skips.
+
+### Cover (added in fio S2)
+
+```
+/spot/api/1/cover/<album_id>/<size>
+```
+
+The album cover as **raw JPEG bytes** — this is the one endpoint that is *not* a
+tab-delimited text document. It is meant to back a Gopher **type-`I`** (image)
+item. `<size>` ∈ `{64, 300, 640}` (the sizes Spotify's CDN serves); the server
+returns the smallest image ≥ the requested size, falling back to the largest
+available.
+
+Covers are **immutable** per `album_id`+size, so the server caches the JPEG bytes
+on disk (24 h). Only a cache **miss** hits Spotify's CDN (logged as `[cover] miss …`
+on stderr); the Radinho asking for a cover on every track change, and the playlist
+asking for N thumbnails at once, are served from cache.
+
+Errors are returned in the normal v1 **text** error format (so a client that gets
+a text body instead of JPEG reads the code):
+
+- `<size>` outside `{64, 300, 640}` (or non-integer / missing) → `bad_range`.
+- unknown `album_id`, or an album with no cover image → `not_found`.
+
 ### Errors
 
 ```
@@ -112,9 +179,10 @@ error	<short code>
 message	<english description>
 ```
 
-Codes: `bad_range`, `no_track`, `not_found`, `upstream` (a Spotify/transport
-failure, or the OAuth Secret not being configured). `message` is human-readable
-English and **not** part of the stable contract — switch on `error`, not on text.
+Codes: `bad_range`, `bad_uri`, `no_track`, `not_found`, `upstream` (a
+Spotify/transport failure, or the OAuth Secret not being configured). `message`
+is human-readable English and **not** part of the stable contract — switch on
+`error`, not on text.
 
 ## Versioning
 
