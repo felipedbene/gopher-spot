@@ -21,6 +21,7 @@ design brief and [the build story](#build-story) for what it cost.
 - [How a "play this track" request flows](#how-a-play-this-track-request-flows)
 - [Code map (UML)](#code-map-uml)
 - [dcgi routing](#dcgi-routing)
+- [The machine API (for the DeToca client)](#the-machine-api-for-the-detoca-client)
 - [Audio delivery: the Icecast fallback](#audio-delivery-the-icecast-fallback)
 - [Design decisions](#design-decisions)
 - [Hard-won gotchas](#hard-won-gotchas)
@@ -62,7 +63,7 @@ flowchart TB
 
     SPOT["Spotify backend<br/>(Web API + Connect AP)"]
 
-    TG -- "gopher menus (MacRoman text)" --> LB1
+    TG -- "gopher menus (Latin-1 text)" --> LB1
     AU -- "GET /spotify.mp3 (parked)" --> LB2
     DCGI -- "HTTPS: search / play / control<br/>(blocking ureq, OAuth)" --> SPOT
     LS  -- "HTTPS: log in as Connect device<br/>(cached credentials.json)" --> SPOT
@@ -111,7 +112,7 @@ sequenceDiagram
     GEO->>D: exec index.dcgi $search … $selector
     D->>API: GET /v1/search?type=track,album,artist&limit=10  (blocking ureq)
     API-->>D: JSON results
-    D-->>GEO: gophermap: track list as /spot/track/{id} links (MacRoman)
+    D-->>GEO: gophermap: track list as /spot/track/{id} links (Latin-1)
     GEO-->>TG: menu
 
     U->>TG: select a track → ">> Tocar agora"
@@ -147,8 +148,8 @@ classDiagram
     class main {
         <<binary>>
         +main() ExitCode
-        -emit(gph) : MacRoman to stdout
-        -run_dcgi(argv) String
+        -emit(gph) : Latin-1 to stdout (GOPHER_ENCODING)
+        -run_dcgi(argv) : Menu(String) | Api(Vec~u8~)
     }
     class oauth {
         <<net feature>>
@@ -169,20 +170,29 @@ classDiagram
         +query(key) Option~String~
     }
     class route {
-        <<function>>
-        +route(args, Option~SpotifyApi~) String
-        matches selector → handler
+        <<functions>>
+        +dcgi::route(args, Option~SpotifyApi~, now_ms) String
+        +api::route(path, args, Option~SpotifyApi~, now_ms) Vec~u8~
+        human selectors → gophermap; /spot/api/* → bytes
+    }
+    class api {
+        <<module — machine API /spot/api/1>>
+        now/play/pause/next/prev/volume/seek
+        queue, queue/add, cover(JPEG), wake, search
+        playlists, playlists/{id}; ~1s /now micro-cache
     }
 
     class SpotifyApi {
         <<trait>>
         +now_playing() Playing
-        +search(q) SearchResults
-        +track(id) Track
-        +play(uri)
-        +control(cmd)
-        +playlists(offset) PlaylistsPage
-        +playlist_tracks(id, offset) TracksPage
+        +queue() Vec~Track~ ; +queue_add(uri)
+        +album_cover(id, px) Vec~u8~
+        +search(q) SearchResults ; +track(id) Track
+        +play(uri) ; +play_context(uri, offset) ; +wake(play)
+        +control(cmd) ; +seek(pos)
+        +playlists(offset) ; +playlist_tracks(id, off) ; +playlist_name(id)
+        +album/album_tracks/artist/artist_albums/artist_top_tracks
+        +cached_now/store_now/invalidate_now_cache
     }
     class Client {
         <<net feature — blocking ureq>>
@@ -199,25 +209,30 @@ classDiagram
 
     class Control {
         <<enum>>
-        Pause / Next / Prev / Volume(u8)
+        Resume / Pause / Next / Prev / Volume(u8)
     }
     class models {
-        Track, Artist, Album
+        Track, Artist, Album, Image
         Playing, SearchResults, Page~T~
-        Device, Playlist
-        PlaylistsPage, TracksPage
+        Device, Playlist, PlaylistTracksRef
+        PlaylistsPage, TracksPage, AlbumDetail, AlbumsPage
     }
 
     class cache {
         <<module — file TTL cache>>
-        +get(dir, key, now) Option~String~
-        +put(dir, key, now, ttl, val)
+        +get/put(dir, key, now, ttl) String
+        +get_bytes/put_bytes (cover JPEGs)
+        +remove(dir, key) : bust /now micro-cache
         FNV-1a keyed files: expiry\npayload
     }
-    class macroman {
-        <<module>>
+    class latin1 {
+        <<module — default encoder>>
         +encode(utf8) Vec~u8~
-        UTF-8 → MacRoman at the IO edge
+        UTF-8 → Latin-1 for Netscape (IO edge)
+    }
+    class macroman {
+        <<module — GOPHER_ENCODING=macroman>>
+        +encode(utf8) Vec~u8~  · TurboGopher fallback
     }
     class menu {
         <<module>>
@@ -233,15 +248,18 @@ classDiagram
 
     main ..> route : dcgi mode
     main ..> menu : root mode
-    main ..> macroman : emit()
+    main ..> latin1 : emit() (default)
+    main ..> macroman : emit() (GOPHER_ENCODING)
+    main ..> api : /spot/api/* (raw bytes)
     main ..> oauth : oauth-init mode
     route ..> DcgiArgs : parses
     route ..> SpotifyApi : Some=live / None=mock
     route ..> menu : clip / gophermaps
     route ..> gopher_core : builds Entry list
+    api ..> SpotifyApi : Some=live / None=in-contract error
     Client ..|> SpotifyApi
     Fake ..|> SpotifyApi
-    Client ..> cache : token + results
+    Client ..> cache : token + results + covers + micro-cache
     Client ..> models : serde
     SpotifyApi ..> Control
     SpotifyApi ..> models
@@ -249,15 +267,18 @@ classDiagram
 
 | Module          | Responsibility                                                                   |
 |-----------------|----------------------------------------------------------------------------------|
-| `main.rs`       | argv dispatch (`root`/`dcgi`/`oauth-init`); MacRoman encode at the stdout edge.  |
-| `dcgi.rs`       | Parse geomyidae's 6 args; route a selector to a gophermap. Pure, fake-testable.  |
+| `main.rs`       | argv dispatch (`root`/`dcgi`/`oauth-init`); wire-encode at the stdout edge; split `/spot/api/*` bytes from human gophermaps. |
+| `dcgi.rs`       | Parse geomyidae's 6 args; route a **human** selector to a gophermap. Pure, fake-testable. |
+| `api.rs`        | The **machine API** (`/spot/api/1/*`): tab-delimited UTF-8 (or raw cover JPEG) served verbatim by a `.cgi`. Frozen v1 contract — see [`API.md`](API.md). |
 | `spotify.rs`    | `SpotifyApi` trait + response models + the real blocking `ureq` `Client`.        |
-| `cache.rs`      | File-backed TTL cache (token, search 5 min, devices 30 s, playlists 60 s).       |
-| `macroman.rs`   | UTF-8 → Mac OS Roman transcode so the OS 9 gopher client renders accents right.  |
+| `cache.rs`      | File-backed TTL cache (token; search 5 min; devices 30 s; playlists 60 s; albums/artists 24 h; cover JPEGs 24 h; `/now` micro-cache ~1 s). Byte-safe + `remove`. |
+| `latin1.rs`     | **UTF-8 → Latin-1** transcode (the default) so Netscape Communicator renders accents right. |
+| `macroman.rs`   | UTF-8 → Mac OS Roman transcode — the `GOPHER_ENCODING=macroman` fallback (TurboGopher). |
 | `menu.rs`       | The static root menu, the RFC-1436 66-column clip, the type-`s` `.pls` line.     |
 
-**28 unit tests**, all offline (`cargo test --no-default-features` builds the pure
-core; `cargo test` adds the URL-encoding + device-pick tests).
+**82 unit tests**, all offline (`cargo test --no-default-features` builds the pure
+core — 79 tests; `cargo test` adds the URL-encoding + device-pick tests). Rendering
+(human menus and the machine API) is tested against a fake `SpotifyApi`, no network.
 
 ---
 
@@ -270,33 +291,75 @@ gophermap. `route()` dispatches purely on the normalized selector path:
 
 ```mermaid
 flowchart LR
-    S([selector]) --> P{path}
+    S([selector]) --> W{"/spot/api/* ?"}
+    W -->|yes| API["api::route → raw bytes<br/>(machine API, see next section)"]
+    W -->|no| P{path}
     P -->|"/spot"| ROOT[root menu]
-    P -->|"/spot/now"| NOW[now_playing]
-    P -->|"/spot/search + query"| SR[search → track links]
+    P -->|"/spot/now"| NOW["now_playing<br/>(+ device warn, [SND] .pls)"]
+    P -->|"/spot/search + query"| SR[search → track/album/artist links]
     P -->|"/spot/track/{id}"| TR["track detail<br/>+ '>> Tocar agora'"]
-    P -->|"/spot/play?uri="| PL[PUT play on device]
-    P -->|"/spot/control"| CM[control menu]
-    P -->|"/spot/control/*"| CTL["pause / next / prev / vol/N"]
-    P -->|"/spot/playlists"| PLS["playlists, 20/page"]
-    P -->|"/spot/playlists/{id}"| PT["playlist tracks, 20/page"]
+    P -->|"/spot/album/{id}"| AL["album page<br/>+ '>> Tocar album'"]
+    P -->|"/spot/artist/{id}(/albums)"| AR["artist page / discography"]
+    P -->|"/spot/play?uri= or ?context_uri=&offset="| PL[PUT play / play_context on device]
+    P -->|"/spot/control(/*)"| CTL["menu · pause / next / prev / vol/N"]
+    P -->|"/spot/playlists(/{id})"| PLS["playlists / tracks, 20/page"]
     P -->|"other"| NF[404 gophermap]
 
-    NOW & SR & TR & PL & CTL & PLS & PT --> A{api?}
+    NOW & SR & TR & AL & AR & PL & CTL & PLS --> A{api?}
     A -->|Some — OAuth Secret present| LIVE[live Spotify data]
-    A -->|None — no Secret| MOCK["Fio B mock menus<br/>(graceful degradation)"]
+    A -->|None — no Secret| MOCK["mock menus<br/>(graceful degradation)"]
 
     style MOCK fill:#5c3a1a,stroke:#d1974f,color:#fff
     style LIVE fill:#1a5c3a,stroke:#4fd18b,color:#fff
+    style API fill:#2a2a3c,stroke:#8b8bff,color:#eee
 ```
 
-`route()` takes `Option<&dyn SpotifyApi>`: `Some` on the live path, `None` when
-the OAuth Secret is absent — in which case it serves mock menus instead of
-crashing. `/spot/stream.pls` is *not* routed here — it's a **real static file**
-(type-`s`, served verbatim) generated at startup from `$AUDIO_STREAM_URL`, because
-a `.pls` must be served raw, not interpreted as a menu.
+`main` splits on the path first: `/spot/api/*` goes to `api::route` (raw bytes —
+the [machine API](#the-machine-api-for-the-detoca-client)), everything else to the
+human `dcgi::route`. Both take `Option<&dyn SpotifyApi>`: `Some` on the live path,
+`None` when the OAuth Secret is absent — the human router then serves mock menus
+and the machine API an in-contract `upstream` error, instead of crashing.
+`/spot/stream.pls` is *not* routed here — it's a **real static file** (type-`s`,
+served verbatim) generated at startup from `$AUDIO_STREAM_URL`, because a `.pls`
+must be served raw, not interpreted as a menu.
 
 ---
+
+## The machine API (for the DeToca client)
+
+The human Gopher menus are PT-BR gophermaps meant for a person driving Netscape.
+A second consumer — **DeToca**, a native OS 9 client — needs a stable,
+machine-parseable surface instead of scraping localized menu text. That's the
+**machine API** at **`/spot/api/1/*`**: a frozen, versioned contract. Full spec in
+[`API.md`](API.md); the shape:
+
+- **Transport.** Each endpoint is a type-0 document of `key<TAB>value` lines,
+  **UTF-8**, CRLF. It's served **raw** by a `.cgi` (`/srv/spot/api/index.cgi`) so
+  geomyidae pipes stdout to the socket verbatim — tabs and non-Latin-1 bytes
+  survive, and there is **no Latin-1 transcode** (that's only for the human
+  menus). `main` routes `/spot/api/*` to `api::route` (→ `Vec<u8>`), never through
+  the gophermap router.
+- **Frozen v1.** Additive changes (new keys) stay in v1; clients MUST ignore
+  unknown keys. Breaking changes would go to `/spot/api/2`.
+
+| Endpoint | Purpose |
+|----------|---------|
+| `now` | playback snapshot: `state`, track/artist/album, `album_id`, `position_ms`/`duration_ms`, `volume`, `queue_len`, **`device active\|idle`**, `ts`. Cached **~1 s** (a poll burst = one upstream call; commands bust it). |
+| `play` `pause` `next` `prev` `volume?N` `seek?N` | transport; each replies with a fresh `now` snapshot. |
+| `queue` · `queue/add?<uri>` | upcoming tracks; enqueue a track. No `queue/clear` (the Web API has none). |
+| `cover/<album_id>/<size>` | **raw JPEG** (type-`I`), sizes 64/300/640, disk-cached 24 h. The one binary endpoint. |
+| `search?q=<urlencoded>` | track search (UTF-8 query); capped at 10 (Spotify 400s `limit>10`). |
+| `wake[?play=1]` | transfer playback to the gopher-spot device (recover a `device idle`); `no_device` if librespot is down. |
+| `playlists` · `playlists/<id>` | list the user's playlists; open one. **Caveat:** Spotify's Nov-2024 dev-mode block 403s playlist *track* reads for this app — even the user's own — so `playlists/<id>` returns `forbidden` today (names/ids still list, and `/spot/play?context_uri=` still plays a playlist as a context). |
+
+Errors are `key<TAB>value` too: `api` / `error <code>` / `message`. Codes:
+`bad_range`, `bad_uri`, `bad_query`, `no_track`, `no_device`, `not_found`,
+`forbidden`, `upstream`.
+
+> **⚠ handlecgi trap.** geomyidae's `handlecgi` splices the child's **stderr** into
+> the client socket, so any `eprintln!`/panic on an API request path prepends bytes
+> to the response — invisible on text, but it *corrupts the cover JPEG*. Rule:
+> **never write to stderr on the `/spot/api/*` path.**
 
 ## Audio delivery: the Icecast fallback
 
@@ -310,25 +373,34 @@ fixes all three failure modes with a **silence fallback mount**:
 flowchart LR
     subgraph src["sources (internal, localhost)"]
         SIL["ffmpeg anullsrc<br/>(always on)"] -->|source| M2["/silence.mp3"]
-        LIVE["librespot | ffmpeg<br/>(only while playing)"] -->|source| M1["/spotify.mp3"]
+        LS["librespot<br/>(pipe backend)"] -->|"PCM → FIFO<br/>/tmp/spotify.pcm"| FF["ffmpeg<br/>(only while playing)"] -->|source| M1["/spotify.mp3"]
     end
+    DR["internal drainer<br/>wget /spotify.mp3 → /dev/null"] -->|"always ≥1 listener"| M1
     M1 -. "fallback-mount + fallback-override<br/>(when live source times out)" .-> M2
     M1 ==>|listeners| AU["MacAST :8000/spotify.mp3"]
     M2 -. fills the gaps .-> AU
 
     style M1 fill:#1a5c3a,stroke:#4fd18b,color:#fff
     style M2 fill:#333,stroke:#888,color:#ddd
+    style DR fill:#3a1a5c,stroke:#a04fd1,color:#fff
 ```
 
 - **Never refused:** idle → listeners hear `/silence.mp3`; a track → `/spotify.mp3`
   overrides and snaps them to live audio.
 - **Multi-client:** many listeners off one source.
-- **Survives idle & track changes** via the fallback + a 2 s respawn loop.
+- **Zero listeners never stops playback** (fio S3/1): an **internal drainer**
+  permanently reads `/spotify.mp3` → `/dev/null`, so Icecast always drains the
+  source. Without it, a playing track with no external listener let the source
+  back up, `ffmpeg` block, and librespot idle (its Connect device dropping).
+- **Self-healing:** PCM flows through a **FIFO** so the entrypoint holds
+  librespot's PID; if `ffmpeg` dies (stale Icecast socket), the loop kills
+  librespot and respawns the whole chain in ~2 s with a fresh source. Total
+  Icecast death is caught k8s-natively by the `livenessProbe` (TCP :8000).
 
 Clients still only ever dial `:8000/spotify.mp3`, so nothing changed for the dcgi,
-the `.pls`, or the Service. Image size is ~140 MB (alpine's `ffmpeg` apk alone is
-~30–40 MB of libav*/lame; the `<40 MB` PROMPT target was not chased — LAN pulls
-once).
+the `.pls`, or the Service. Image is **~60 MB** compressed (alpine's `ffmpeg` apk
+alone is ~30–40 MB of libav*/lame; the `<40 MB` PROMPT target was not chased — LAN
+pulls once). The gopher-server image is ~5 MB (musl-static Rust + geomyidae).
 
 ---
 
@@ -378,15 +450,18 @@ them earned:
 | # | Gotcha | Fix |
 |---|--------|-----|
 | 1 | librespot **0.6.0 can't play any track** after a Nov-2025 Spotify change (auth + device OK, zero PCM). | Build the **dev branch (0.8.0)**, pinned rev, `--features rustls-tls-webpki-roots`. |
-| 2 | Spotify `/v1/search` **400s on `limit=20`** ("Invalid limit") despite docs saying 0–50. | `SEARCH_LIMIT=10`. |
+| 2 | Spotify `/v1/search` **400s "Invalid limit" for any `limit>10`** (verified: 20 *and* 50 both fail, even single-type) despite docs saying 0–50. | Hard-cap `SEARCH_LIMIT=10`. |
 | 3 | Spotify **deprecated `localhost`** in OAuth redirect URIs. | Explicit loopback `http://127.0.0.1:8888/callback`, registered + used identically. |
 | 4 | librespot **zeroconf (mDNS) can't reach the LAN from an overlay pod**. | Credentials mode (see Discovery). |
-| 5 | `ffmpeg -listen 1` gave **"connection refused" on idle**, one client only, dropped on gaps. | Icecast + silence fallback. |
+| 5 | `ffmpeg -listen 1` gave **"connection refused" on idle**, one client only, dropped on gaps. | Icecast + silence fallback + FIFO respawn + internal drainer. |
 | 6 | Binding **:70 as non-root** in the pod. | File cap `cap_net_bind_service=+ep` on geomyidae + keep `NET_BIND_SERVICE` in the bounding set + `allowPrivilegeEscalation: true`. |
 | 7 | geomyidae stamps `GOPHER_HOST` into every link; wrong value → **links won't follow** from the Mac. | Set it to the gopher-server LB IP (chicken-and-egg: apply, read IP, re-apply). |
 | 8 | An **in-process cache never survives** — the dcgi is exec'd per request. | File TTL cache in an emptyDir (`cache.rs`). |
-| 9 | Accented names (`Construção`) render as garbage on OS 9 without transcoding. | `macroman::encode` at the stdout edge; ASCII (incl. every `[ ] \| \t \n`) is identity. |
+| 9 | Accented names (`Construção`) rendered as garbage on OS 9. The actual client is **Netscape**, which reads charset-less Gopher as **Latin-1** — not MacRoman. | `latin1::encode` at the stdout edge (default); `macroman` kept as the `GOPHER_ENCODING` fallback. ASCII (incl. every `[ ] \| \t \n`) is identity. |
 | 10 | ghcr packages default **private** → `ImagePullBackOff`. | Make packages public (or use the `ghcr-pull` imagePullSecret). |
+| 11 | geomyidae's **`handlecgi` splices the child's stderr** into the client socket → any `eprintln!` on the `/spot/api/*` path corrupts the response (silently for text; a garbled cover JPEG for binary). | **Never write to stderr on the API path.** |
+| 12 | Spotify **403s playlist track reads for every playlist — including the user's own** (Nov-2024 dev-mode block, *not* a scope gap: the token has `playlist-read-private`). | Map 403→`forbidden`; list names/ids only; play playlists as a **context** (needs no track-read). |
+| 13 | `%XX` query decode as Latin-1 **mangles UTF-8** (`search?q=construção`). | Decode into bytes, then `from_utf8_lossy` (`DcgiArgs::query`). |
 
 ---
 
@@ -434,8 +509,9 @@ it without cluster routing.
 
 ## Build story
 
-Built solo, across **two sittings**, ~10 hours of active work, **14 commits**,
-~1,600 lines of Rust (28 tests) plus Dockerfiles, k8s manifests, and shell.
+The **original build** was solo, across **two sittings**, ~10 hours of active
+work, **14 commits**, ~1,600 lines of Rust (28 tests) plus Dockerfiles, k8s
+manifests, and shell. (It has since grown — see the note after the timeline.)
 
 ```mermaid
 gantt
@@ -468,6 +544,13 @@ The lopsided ratio — features in an evening, one audio bug across a morning �
 the real lesson: gluing modern SaaS to vintage clients, the protocol translation
 is easy; the **stateful media plane** is where the time goes.
 
+**Since then** (2026-07-02/03) the project roughly doubled: a navigable music
+graph (album/artist/discography pages), the switch to **Latin-1** for Netscape,
+inline transport controls, audio robustness (FIFO respawn + internal drainer), and
+the whole **`/spot/api/1` machine API** for the DeToca client (`now`/transport,
+`queue`, `cover`, `search`, `device`+`wake`, `playlists`, context play, the ~1 s
+micro-cache). Current totals: **~30 commits, ~4,100 lines of Rust, 82 tests.**
+
 ---
 
 ## Repo layout
@@ -475,15 +558,18 @@ is easy; the **stateful media plane** is where the time goes.
 ```
 gopher-spot/
 ├── README.md                         # this file
+├── API.md                            # frozen /spot/api/1 machine-API contract
 ├── PROMPT.md                         # original design brief (pt-BR)
 ├── Cargo.toml                        # net feature gates ureq; serde always on
 ├── src/
-│   ├── main.rs                       # argv dispatch + MacRoman stdout edge + oauth
+│   ├── main.rs                       # argv dispatch + Latin-1 stdout edge + api/menu split + oauth
 │   ├── lib.rs                        # module root
-│   ├── dcgi.rs                       # selector → gophermap routing (fake-testable)
+│   ├── dcgi.rs                       # human selector → gophermap routing (fake-testable)
+│   ├── api.rs                        # machine API /spot/api/1 → bytes (fake-testable)
 │   ├── spotify.rs                    # SpotifyApi trait + models + blocking Client
-│   ├── cache.rs                      # file-backed TTL cache
-│   ├── macroman.rs                   # UTF-8 → Mac OS Roman
+│   ├── cache.rs                      # file-backed TTL cache (byte-safe; remove)
+│   ├── latin1.rs                     # UTF-8 → Latin-1 (default, for Netscape)
+│   ├── macroman.rs                   # UTF-8 → Mac OS Roman (GOPHER_ENCODING fallback)
 │   └── menu.rs                       # root menu, 66-col clip, type-s .pls line
 ├── docker/
 │   ├── audio-stream.Dockerfile       # librespot(dev) + ffmpeg + icecast, multi-arch
@@ -506,4 +592,6 @@ gopher-spot/
 
 No VPS (`gopher.debene.dev` is untouched), no Spotify reimplementation (librespot
 does Connect), no GUI anywhere but Gopher, no Spotify Free (Premium only), no
-gapless, no cover art, no public exposure. LAN-only, by design.
+gapless, no public exposure. LAN-only, by design. (Cover art *is* served — as raw
+JPEG on the machine API's `cover` endpoint for the DeToca client — but the human
+Gopher menus stay text-only.)
