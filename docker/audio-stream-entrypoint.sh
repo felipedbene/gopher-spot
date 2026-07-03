@@ -140,6 +140,33 @@ sleep 3
   done
 ) &
 
+# --- Internal drainer: the invariant "zero listeners never stops playback" ---
+#
+# The bug (observed in the fio S2 validation): with a track playing but NO client
+# on /spotify.mp3, the live chain wedges and librespot goes idle — Spotify then
+# marks the gopher-spot device as no-longer-playing. Chain of backpressure: with
+# no listener Icecast stops draining the ffmpeg source socket, the `-re`-paced
+# ffmpeg blocks on write, so it stops reading the FIFO, so librespot blocks
+# writing PCM into the FIFO, so its playback stalls and the Connect device idles.
+# (During S2 this was worked around by hand — a manual `curl` kept it alive.)
+#
+# Fix: keep ONE internal listener permanently attached to /spotify.mp3, reading
+# and discarding. Icecast always has a client to serve, so it always drains the
+# source, so ffmpeg and librespot never block — a playing track keeps playing
+# whether or not MacAST (or anyone) is connected. This makes zero *external*
+# listeners a non-event, which is the fio S3/1 contract. The drainer costs one
+# Icecast client slot (of <clients>20</clients>) and ~16 KB/s it throws away.
+#
+# It reconnects if the stream drops (a live-chain respawn or an Icecast restart
+# closes the socket -> wget returns -> we loop). /spotify.mp3 always has bytes to
+# give (live, or the silence fallback), so wget never idle-times-out mid-read.
+(
+  while true; do
+    wget -q -O /dev/null "http://127.0.0.1:8000/spotify.mp3" || true
+    sleep 1
+  done
+) &
+
 # Live source: librespot -> FIFO -> ffmpeg -> /spotify.mp3.
 #
 # librespot writes PCM into the FIFO in the background so we keep its PID; ffmpeg
@@ -153,6 +180,18 @@ sleep 3
 #
 # No `-re` on the pipe input: librespot already produces PCM at realtime, so `-re`
 # would only add a second throttle and risk a catch-up burst after a gap.
+#
+# Watchdog (fio S3/1), two layers, both prefer the simplest mechanism that works:
+#   1. This `while true` loop IS the self-healer for the live chain: kill ffmpeg
+#      (or let it die on a stale socket) and the loop tears down librespot and
+#      respawns the whole chain within ~2 s + librespot's reconnect. No external
+#      supervisor needed.
+#   2. Total Icecast death (the one thing this loop can't fix — it'd just spin on
+#      "connection refused") is caught k8s-natively by the Deployment's
+#      livenessProbe (TCP :8000): a few failed probes restart the container. We
+#      deliberately do NOT probe "is the live mount flowing", because legitimate
+#      pause/idle also stops the live source — a TCP probe on Icecast is the
+#      simplest check that distinguishes "server dead" from "nothing playing".
 FIFO=/tmp/spotify.pcm
 [ -p "$FIFO" ] || mkfifo "$FIFO"
 while true; do
