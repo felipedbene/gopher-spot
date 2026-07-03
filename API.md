@@ -185,6 +185,36 @@ from or clear the queue (only add). It is deliberately absent from v1; if Spotif
 ever adds one it can be added additively. We do **not** emulate it with chained
 skips.
 
+### Search (added in fio S3/4)
+
+```
+/spot/api/1/search?q=<urlencoded query>
+```
+
+Track search. Returns a v1 **list** (same `item.<i>.*` shape as `/queue`), with
+`result_len` as the count header:
+
+| key                    | when     | value                                    |
+|------------------------|----------|------------------------------------------|
+| `api`                  | always   | `1`                                      |
+| `result_len`           | always   | number of tracks (`0` if none)           |
+| `item.<i>.uri`         | per item | `spotify:track:<id>`                     |
+| `item.<i>.track`       | per item | track name                               |
+| `item.<i>.artist`      | per item | artist name(s), joined with `, `         |
+| `item.<i>.album_id`    | album    | Spotify album id (for `/cover`)          |
+| `item.<i>.duration_ms` | per item | track length (int, ms)                   |
+| `ts`                   | always   | unix epoch **ms** at snapshot time        |
+
+- `q` is the **urlencoded** query; UTF-8 is decoded correctly, so
+  `search?q=constru%C3%A7%C3%A3o` searches for `construção`.
+- Empty or absent `q` (including whitespace-only) → `bad_query`.
+- **Tracks only** for now (`type=track`), and **capped at 10** results:
+  Spotify's `/v1/search` **400s `limit>10`** ("Invalid limit") — verified
+  empirically (`limit=20` and `limit=50` both 400, `limit=10` works). So although
+  the client should read `result_len`, it will not exceed 10 in v1. (The PROMPT's
+  "limit 20" was dropped for this hard Spotify constraint; a client must not
+  assume a fixed count.)
+
 ### Cover (added in fio S2)
 
 ```
@@ -216,9 +246,10 @@ error	<short code>
 message	<english description>
 ```
 
-Codes: `bad_range`, `bad_uri`, `no_track`, `no_device` (fio S3/3: `wake` found no
-registered gopher-spot device), `not_found`, `upstream` (a Spotify/transport
-failure, or the OAuth Secret not being configured). `message`
+Codes: `bad_range`, `bad_uri`, `bad_query` (fio S3/4: empty search `q`),
+`no_track`, `no_device` (fio S3/3: `wake` found no registered gopher-spot
+device), `not_found`, `upstream` (a Spotify/transport failure, or the OAuth Secret
+not being configured). `message`
 is human-readable English and **not** part of the stable contract — switch on
 `error`, not on text.
 

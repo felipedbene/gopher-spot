@@ -63,6 +63,7 @@ pub fn route(path: &str, args: &DcgiArgs, api: Option<&dyn SpotifyApi>, now_ms: 
         "queue" => queue_doc(api, now_ms),
         "queue/add" => queue_add(api, args, now_ms),
         "wake" => wake(api, args, now_ms),
+        "search" => search_doc(api, args, now_ms),
         other => error("not_found", &format!("unknown endpoint: {other}")),
     };
     text.into_bytes()
@@ -95,6 +96,39 @@ fn queue_add(api: &dyn SpotifyApi, args: &DcgiArgs, now_ms: i64) -> String {
         }
         Err(e) => error("upstream", &e),
     }
+}
+
+/// `/search?q=<urlencoded>`: track results as a v1 list (same `item.<i>.*` shape
+/// as `/queue`), with `result_len` as the count header. Tracks only for now.
+/// Empty/absent `q` -> `bad_query`. The query is UTF-8 (accents decode correctly —
+/// see the dcgi urldecode). NB: Spotify 400s `limit>10` on /v1/search (a
+/// documented quirk), so results are capped at 10 — the reused `search()` limit.
+fn search_doc(api: &dyn SpotifyApi, args: &DcgiArgs, now_ms: i64) -> String {
+    let q = args.query("q").unwrap_or_default();
+    let q = q.trim();
+    if q.is_empty() {
+        return error("bad_query", "search needs a non-empty q");
+    }
+    match api.search(q) {
+        Ok(r) => {
+            let tracks = r.tracks.as_ref().map(|p| p.items.as_slice()).unwrap_or(&[]);
+            search_snapshot(tracks, now_ms)
+        }
+        Err(e) => error("upstream", &e),
+    }
+}
+
+/// The `/search` document: `result_len` then one indexed `item.<i>.*` block per
+/// track, in Spotify's relevance order. Same item shape as `/queue`.
+fn search_snapshot(tracks: &[Track], now_ms: i64) -> String {
+    let mut out = String::new();
+    kv(&mut out, "api", &API_VERSION.to_string());
+    kv(&mut out, "result_len", &tracks.len().to_string());
+    for (i, t) in tracks.iter().enumerate() {
+        push_item(&mut out, i, t);
+    }
+    kv(&mut out, "ts", &now_ms.to_string());
+    out
 }
 
 /// `/cover/<album_id>/<size>`: raw JPEG bytes. `size` outside {64,300,640} ->
@@ -289,24 +323,31 @@ fn queue_snapshot(items: &[Track], now_ms: i64) -> String {
     kv(&mut out, "api", &API_VERSION.to_string());
     kv(&mut out, "queue_len", &items.len().to_string());
     for (i, t) in items.iter().enumerate() {
-        kv(&mut out, &format!("item.{i}.uri"), &t.uri);
-        kv(&mut out, &format!("item.{i}.track"), &t.name);
-        kv(&mut out, &format!("item.{i}.artist"), &t.artist_line());
-        if let Some(aid) = t
-            .album
-            .as_ref()
-            .and_then(|a| crate::spotify::id_from_uri(&a.uri))
-        {
-            kv(&mut out, &format!("item.{i}.album_id"), aid);
-        }
-        kv(
-            &mut out,
-            &format!("item.{i}.duration_ms"),
-            &t.duration_ms.to_string(),
-        );
+        push_item(&mut out, i, t);
     }
     kv(&mut out, "ts", &now_ms.to_string());
     out
+}
+
+/// The shared `item.<i>.*` block for a track — used by both `/queue` and
+/// `/search`: uri/track/artist, `album_id` when the album carries a uri, and
+/// duration_ms. Keeps the "exactly one TAB per line" wire invariant.
+fn push_item(out: &mut String, i: usize, t: &Track) {
+    kv(out, &format!("item.{i}.uri"), &t.uri);
+    kv(out, &format!("item.{i}.track"), &t.name);
+    kv(out, &format!("item.{i}.artist"), &t.artist_line());
+    if let Some(aid) = t
+        .album
+        .as_ref()
+        .and_then(|a| crate::spotify::id_from_uri(&a.uri))
+    {
+        kv(out, &format!("item.{i}.album_id"), aid);
+    }
+    kv(
+        out,
+        &format!("item.{i}.duration_ms"),
+        &t.duration_ms.to_string(),
+    );
 }
 
 /// An error document: `api` / `error <code>` / `message <english>`.
@@ -337,7 +378,7 @@ fn kv(out: &mut String, key: &str, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spotify::{Album, ApiError, Artist, Device, SearchResults, Track};
+    use crate::spotify::{Album, ApiError, Artist, Device, Page, SearchResults, Track};
     use crate::spotify::{AlbumDetail, AlbumsPage, PlaylistsPage, TracksPage};
     use std::cell::RefCell;
 
@@ -480,8 +521,16 @@ mod tests {
             *self.last_seek.borrow_mut() = Some(position_ms);
             Ok(())
         }
-        fn search(&self, _q: &str) -> Result<SearchResults, ApiError> {
-            unimplemented!()
+        fn search(&self, q: &str) -> Result<SearchResults, ApiError> {
+            // Echo the (decoded) query into the track names so a test can assert
+            // the API search path decoded UTF-8 correctly end-to-end.
+            Ok(SearchResults {
+                tracks: Some(Page {
+                    items: vec![track(&format!("hit {q} A")), track(&format!("hit {q} B"))],
+                }),
+                artists: None,
+                albums: None,
+            })
         }
         fn track(&self, _id: &str) -> Result<Track, ApiError> {
             unimplemented!()
@@ -891,5 +940,41 @@ mod tests {
         now_at(&f, TS); // caches /now
         call(&f, "/spot/api/1/wake"); // command -> must invalidate + refetch
         assert_eq!(*f.now_calls.borrow(), 2);
+    }
+
+    // ---- fio S3/4: search -----------------------------------------------------
+
+    #[test]
+    fn search_lists_tracks_with_result_len() {
+        let f = fake(playing_track());
+        let out = call(&f, "/spot/api/1/search?q=chico");
+        assert_wire(&out);
+        assert!(out.contains("api\t1\r\n"));
+        assert!(out.contains("result_len\t2\r\n"));
+        assert!(out.contains("item.0.uri\tspotify:track:abc123\r\n"));
+        assert!(out.contains("item.0.track\thit chico A\r\n"));
+        assert!(out.contains("item.0.artist\tChico Buarque, MPB4\r\n"));
+        assert!(out.contains("item.0.album_id\tal1\r\n"));
+        assert!(out.contains("item.0.duration_ms\t380000\r\n"));
+        assert!(out.contains("item.1.track\thit chico B\r\n"));
+        assert!(out.contains(&format!("ts\t{TS}\r\n")));
+    }
+
+    #[test]
+    fn search_decodes_utf8_query_end_to_end() {
+        // %C3%A7%C3%A3o -> ç ã o. The fake echoes the decoded query into the track
+        // name, so an intact accent here proves the API search decodes UTF-8.
+        let f = fake(playing_track());
+        let out = call(&f, "/spot/api/1/search?q=constru%C3%A7%C3%A3o");
+        assert!(out.contains("item.0.track\thit construção A\r\n"), "{out}");
+    }
+
+    #[test]
+    fn search_empty_or_absent_q_is_bad_query() {
+        let f = fake(playing_track());
+        assert!(call(&f, "/spot/api/1/search?q=").contains("error\tbad_query\r\n"));
+        assert!(call(&f, "/spot/api/1/search").contains("error\tbad_query\r\n"));
+        // whitespace-only decodes to empty after trim
+        assert!(call(&f, "/spot/api/1/search?q=%20%20").contains("error\tbad_query\r\n"));
     }
 }

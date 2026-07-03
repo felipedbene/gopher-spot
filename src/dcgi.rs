@@ -768,33 +768,37 @@ fn search_mock(query: &str) -> String {
     ])
 }
 
-/// Minimal percent-decode for query values (`%XX` and `+` -> space).
+/// Minimal percent-decode for query values (`%XX` and `+` -> space). Decodes into
+/// BYTES and reads them back as UTF-8: a `%C3%A7` pair is one `ç`, not two Latin-1
+/// chars. (Decoding each `%XX` straight into a `char` — as this once did — mangles
+/// any multi-byte UTF-8, e.g. the API `search?q=construção`.) Values are ASCII in
+/// most callers (`play?uri=spotify:track:…`), where byte- and char-decode agree.
 fn urldecode(s: &str) -> String {
     let b = s.as_bytes();
-    let mut out = String::with_capacity(s.len());
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
         match b[i] {
             b'%' if i + 2 < b.len() => {
                 if let Ok(h) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                    out.push(h as char);
+                    out.push(h);
                     i += 3;
                     continue;
                 }
-                out.push('%');
+                out.push(b'%');
                 i += 1;
             }
             b'+' => {
-                out.push(' ');
+                out.push(b' ');
                 i += 1;
             }
             c => {
-                out.push(c as char);
+                out.push(c);
                 i += 1;
             }
         }
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[cfg(test)]
@@ -1209,5 +1213,13 @@ mod tests {
     fn query_decode_handles_percent_and_plus() {
         let a = DcgiArgs::from_argv(&argv("", "/spot/play?uri=spotify%3Atrack%3Aabc"));
         assert_eq!(a.query("uri"), Some("spotify:track:abc".into()));
+    }
+
+    #[test]
+    fn query_decode_is_utf8_byte_correct() {
+        // %C3%A7%C3%A3o must round-trip to "ção" (one char per multi-byte seq),
+        // not four Latin-1 chars — the fio S3/4 API search?q= relies on this.
+        let a = DcgiArgs::from_argv(&argv("", "/spot/api/1/search?q=constru%C3%A7%C3%A3o"));
+        assert_eq!(a.query("q"), Some("construção".into()));
     }
 }
