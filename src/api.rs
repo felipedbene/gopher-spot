@@ -53,7 +53,7 @@ pub fn route(path: &str, args: &DcgiArgs, api: Option<&dyn SpotifyApi>, now_ms: 
         return cover(api, sub.strip_prefix("cover/").unwrap_or(""));
     }
     let text = match sub {
-        "now" => snapshot_or_error(api, now_ms),
+        "now" => now_document(api, now_ms),
         "play" => command(api, now_ms, Control::Resume),
         "pause" => command(api, now_ms, Control::Pause),
         "next" => command(api, now_ms, Control::Next),
@@ -86,7 +86,12 @@ fn queue_add(api: &dyn SpotifyApi, args: &DcgiArgs, now_ms: i64) -> String {
         return error("bad_uri", "queue/add needs a spotify:track:<id> uri");
     }
     match api.queue_add(uri) {
-        Ok(()) => queue_doc(api, now_ms),
+        // The queue changed, so a cached /now (with its stale queue_len) is now
+        // wrong — bust it, then return the fresh /queue snapshot (fio S3/2).
+        Ok(()) => {
+            api.invalidate_now_cache();
+            queue_doc(api, now_ms)
+        }
         Err(e) => error("upstream", &e),
     }
 }
@@ -125,7 +130,7 @@ fn is_track_uri(uri: &str) -> bool {
 fn volume(api: &dyn SpotifyApi, args: &DcgiArgs, now_ms: i64) -> String {
     match args.raw_arg().trim().parse::<i64>() {
         Ok(v) if (0..=100).contains(&v) => match api.control(Control::Volume(v as u8)) {
-            Ok(()) => snapshot_or_error(api, now_ms),
+            Ok(()) => fresh_now(api, now_ms),
             Err(e) => error("upstream", &e),
         },
         _ => error("bad_range", "volume must be an integer 0-100"),
@@ -153,7 +158,7 @@ fn seek(api: &dyn SpotifyApi, args: &DcgiArgs, now_ms: i64) -> String {
         _ => return error("no_track", "nothing playing to seek"),
     };
     match api.seek(pos.min(duration)) {
-        Ok(()) => snapshot_or_error(api, now_ms),
+        Ok(()) => fresh_now(api, now_ms),
         Err(e) => error("upstream", &e),
     }
 }
@@ -164,8 +169,8 @@ fn seek(api: &dyn SpotifyApi, args: &DcgiArgs, now_ms: i64) -> String {
 /// snapshot, so `play` while playing is a no-op success (contract rule).
 fn command(api: &dyn SpotifyApi, now_ms: i64, cmd: Control) -> String {
     match api.control(cmd) {
-        Ok(()) => snapshot_or_error(api, now_ms),
-        Err(_) if already_in_state(api, cmd) => snapshot_or_error(api, now_ms),
+        Ok(()) => fresh_now(api, now_ms),
+        Err(_) if already_in_state(api, cmd) => fresh_now(api, now_ms),
         Err(e) => error("upstream", &e),
     }
 }
@@ -184,15 +189,30 @@ fn already_in_state(api: &dyn SpotifyApi, cmd: Control) -> bool {
     }
 }
 
-/// Fetch the current state and render a `/now` snapshot. Queue length is
-/// best-effort (never blocks the snapshot on it), mirroring the human Now Playing.
-fn snapshot_or_error(api: &dyn SpotifyApi, now_ms: i64) -> String {
+/// The `/now` document, served from the ~1s micro-cache (fio S3/2) when warm,
+/// else fetched fresh and cached. Queue length is best-effort (never blocks the
+/// snapshot on it), mirroring the human Now Playing. An error is never cached — a
+/// transient upstream failure shouldn't stick for the whole TTL window.
+fn now_document(api: &dyn SpotifyApi, now_ms: i64) -> String {
+    if let Some(cached) = api.cached_now(now_ms) {
+        return cached;
+    }
     let playing = match api.now_playing() {
         Ok(p) => p,
         Err(e) => return error("upstream", &e),
     };
     let queue_len = api.queue().map(|q| q.len()).unwrap_or(0);
-    snapshot(&playing, queue_len, now_ms)
+    let doc = snapshot(&playing, queue_len, now_ms);
+    api.store_now(now_ms, &doc);
+    doc
+}
+
+/// A command's reply: bust the micro-cache (so this and every later `/now`
+/// reflects the command instead of a pre-command snapshot), then return a fresh
+/// `/now` document — which also reseeds the cache with post-command state.
+fn fresh_now(api: &dyn SpotifyApi, now_ms: i64) -> String {
+    api.invalidate_now_cache();
+    now_document(api, now_ms)
 }
 
 /// The `/now` document. Metadata keys (`track`..`duration_ms`) appear only when a
@@ -337,6 +357,11 @@ mod tests {
         last: RefCell<Option<Control>>,
         last_seek: RefCell<Option<u64>>,
         last_queued: RefCell<Option<String>>,
+        // fio S3/2 micro-cache: count upstream now_playing fetches, and back the
+        // cache with an in-memory (expiry_ms, doc) slot so a test can assert a
+        // poll burst folds to one fetch and a command busts it.
+        now_calls: RefCell<u32>,
+        now_cache: RefCell<Option<(i64, String)>>,
     }
     fn fake(playing: Playing) -> Fake {
         Fake {
@@ -346,6 +371,8 @@ mod tests {
             last: RefCell::new(None),
             last_seek: RefCell::new(None),
             last_queued: RefCell::new(None),
+            now_calls: RefCell::new(0),
+            now_cache: RefCell::new(None),
         }
     }
     fn playing_track() -> Playing {
@@ -372,7 +399,21 @@ mod tests {
 
     impl SpotifyApi for Fake {
         fn now_playing(&self) -> Result<Playing, ApiError> {
+            *self.now_calls.borrow_mut() += 1;
             Ok(self.playing.clone())
+        }
+        fn cached_now(&self, now_ms: i64) -> Option<String> {
+            self.now_cache
+                .borrow()
+                .as_ref()
+                .filter(|(exp, _)| now_ms < *exp)
+                .map(|(_, d)| d.clone())
+        }
+        fn store_now(&self, now_ms: i64, doc: &str) {
+            *self.now_cache.borrow_mut() = Some((now_ms + 1_000, doc.to_string()));
+        }
+        fn invalidate_now_cache(&self) {
+            *self.now_cache.borrow_mut() = None;
         }
         fn queue(&self) -> Result<Vec<Track>, ApiError> {
             if self.empty_queue {
@@ -701,5 +742,58 @@ mod tests {
         assert!(missing.contains("error\tnot_found\r\n"));
         let noimg = String::from_utf8(call_bytes(&f, "/spot/api/1/cover/noimg/300")).unwrap();
         assert!(noimg.contains("error\tnot_found\r\n"));
+    }
+
+    // ---- fio S3/2: /now micro-cache -------------------------------------------
+
+    /// Poll `/now` at an explicit wall-clock (ms), returning the document.
+    fn now_at(f: &Fake, now_ms: i64) -> String {
+        let args = DcgiArgs::from_argv(&argv("/spot/api/1/now"));
+        String::from_utf8(route(&args.path(), &args, Some(f), now_ms)).unwrap()
+    }
+
+    #[test]
+    fn now_polls_within_ttl_hit_cache_once_with_original_ts() {
+        let f = fake(playing_track());
+        let a = now_at(&f, TS); // miss -> fetch + store
+        let b = now_at(&f, TS + 500); // within 1s -> cache hit
+        let c = now_at(&f, TS + 999); // still within -> cache hit
+        assert_eq!(*f.now_calls.borrow(), 1, "three polls, one upstream fetch");
+        // Every poll in the window carries the ORIGINAL ts, so the client's
+        // interpolation absorbs the staleness.
+        assert!(a.contains(&format!("ts\t{TS}\r\n")));
+        assert_eq!(a, b);
+        assert_eq!(b, c);
+    }
+
+    #[test]
+    fn now_cache_expires_after_ttl() {
+        let f = fake(playing_track());
+        now_at(&f, TS); // fetch #1
+        now_at(&f, TS + 1_000); // TTL boundary (now_ms >= expiry) -> fetch #2
+        assert_eq!(*f.now_calls.borrow(), 2);
+    }
+
+    #[test]
+    fn command_busts_now_cache_within_window() {
+        let f = fake(playing_track());
+        now_at(&f, TS); // fetch #1, caches until TS+1000
+        // A command mid-window must invalidate: without the bust, `next`'s reply
+        // would read the still-valid cached snapshot (no fetch) -> count 1.
+        let args = DcgiArgs::from_argv(&argv("/spot/api/1/next"));
+        route(&args.path(), &args, Some(&f), TS + 100);
+        assert_eq!(*f.now_calls.borrow(), 2, "command forced a fresh snapshot");
+        // The command reseeded the cache at TS+100, so a poll at TS+200 is a hit.
+        now_at(&f, TS + 200);
+        assert_eq!(*f.now_calls.borrow(), 2);
+    }
+
+    #[test]
+    fn queue_add_busts_now_cache() {
+        let f = fake(playing_track());
+        now_at(&f, TS); // caches /now
+        call(&f, "/spot/api/1/queue/add?spotify:track:xyz"); // must invalidate
+        now_at(&f, TS + 100); // would be a stale hit if not invalidated -> fetch
+        assert_eq!(*f.now_calls.borrow(), 2);
     }
 }

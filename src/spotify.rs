@@ -237,6 +237,24 @@ pub trait SpotifyApi {
     fn artist_albums(&self, id: &str, offset: u32) -> Result<AlbumsPage, ApiError>;
     /// An artist's top tracks (market inferred from the token).
     fn artist_top_tracks(&self, id: &str) -> Result<Vec<Track>, ApiError>;
+
+    // ---- /now micro-cache (fio S3/2) --------------------------------------
+    // A rendered `/now` document served from a ~1s TTL cache: a burst of polls
+    // collapses to one upstream fetch, and each poll in the window gets the same
+    // document (same `ts`) so the client interpolates the delta. The default
+    // no-ops disable caching (test fakes that don't exercise it, and the offline
+    // path); the real Client backs them with the on-disk TTL cache, keyed on the
+    // request wall-clock in ms.
+
+    /// The cached `/now` document if one was stored < ~1s before `now_ms`.
+    fn cached_now(&self, _now_ms: i64) -> Option<String> {
+        None
+    }
+    /// Store the just-rendered `/now` `doc`, stamped at `now_ms`, for the TTL.
+    fn store_now(&self, _now_ms: i64, _doc: &str) {}
+    /// Drop any cached `/now` so the next poll re-fetches. Commands call this so a
+    /// state change is never masked by a stale cached snapshot.
+    fn invalidate_now_cache(&self) {}
 }
 
 // ---- The real blocking client (net feature) --------------------------------
@@ -263,6 +281,12 @@ mod net {
     const PLAYLISTS_TTL: i64 = 60; // 60 s
     const CATALOG_TTL: i64 = 86_400; // 24h — albums/artists are effectively static
     const HTTP_TIMEOUT_SECS: u64 = 10;
+    // /now micro-cache window (fio S3/2). Kept in MILLISECONDS: the `now_snapshot`
+    // entry is written and read with the request wall-clock in ms (not the seconds
+    // clock the other keys use), so the cache module's opaque expiry comparison
+    // gives us a true ~1s window. Short enough that the client's ts-interpolation
+    // fully absorbs the staleness; long enough to fold a poll burst into one call.
+    const NOW_CACHE_TTL_MS: i64 = 1_000;
 
     #[derive(Deserialize)]
     struct RawPlaylists {
@@ -702,6 +726,27 @@ mod net {
             )?;
             let r: RawTopTracks = serde_json::from_str(&body).map_err(|e| e.to_string())?;
             Ok(r.tracks)
+        }
+
+        // ---- /now micro-cache (fio S3/2) ----------------------------------
+        // Backed by the on-disk TTL cache under a fixed `now_snapshot` key, but
+        // clocked in MS (we pass now_ms where the module wants a "now"), so the
+        // TTL is a real ~1s window regardless of the seconds clock the token/
+        // search/catalog entries use. Per-replica, like every other cache entry.
+        fn cached_now(&self, now_ms: i64) -> Option<String> {
+            cache::get(&self.state_dir, "now_snapshot", now_ms)
+        }
+        fn store_now(&self, now_ms: i64, doc: &str) {
+            cache::put(
+                &self.state_dir,
+                "now_snapshot",
+                now_ms,
+                NOW_CACHE_TTL_MS,
+                doc,
+            );
+        }
+        fn invalidate_now_cache(&self) {
+            cache::remove(&self.state_dir, "now_snapshot");
         }
     }
 

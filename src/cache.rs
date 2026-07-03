@@ -65,6 +65,13 @@ pub fn put_bytes(dir: &Path, key: &str, now_unix: i64, ttl_secs: i64, payload: &
     let _ = std::fs::write(key_file(dir, key), buf);
 }
 
+/// Drop a cached entry now, ignoring whether it existed (best-effort). Used to
+/// bust the `/now` micro-cache (fio S3/2) when a command changes playback state,
+/// so the next `/now` re-fetches instead of serving a stale snapshot.
+pub fn remove(dir: &Path, key: &str) {
+    let _ = std::fs::remove_file(key_file(dir, key));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

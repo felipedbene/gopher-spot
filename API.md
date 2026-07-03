@@ -196,6 +196,15 @@ is human-readable English and **not** part of the stable contract — switch on
 
 ## Known deviations
 
+- **`/now` micro-cache (added in fio S3/2).** The server caches the rendered
+  `/now` document for **~1 second**. A burst of polls inside that window collapses
+  to a **single** upstream Spotify call, and every poll in the window returns the
+  **same document — including the same `ts`**. This is deliberate: interpolate the
+  progress with `ts` (`estimated_position = position_ms + (now − ts)`) and a
+  ≤1 s-stale snapshot is invisible. **Commands bust the cache**: after any
+  `play`/`pause`/`next`/`prev`/`volume`/`seek`/`queue/add`/`wake`, the next `/now`
+  is fetched fresh, so a state change is never masked by the cache. The TTL is a
+  fixed constant (no configuration); errors are never cached.
 - **Eventual consistency after a command.** The snapshot a command returns
   reflects what Spotify's Web API reports *at that instant*. Spotify is eventually
   consistent for the librespot Connect device: a `seek` (and sometimes the device
