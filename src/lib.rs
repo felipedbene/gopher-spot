@@ -17,6 +17,7 @@
 //! (`latin1`), so that's the default; `macroman` is kept for TurboGopher. The
 //! encoder is chosen at runtime by `GOPHER_ENCODING` (see `main.rs`).
 
+pub mod api;
 pub mod cache;
 pub mod dcgi;
 pub mod latin1;

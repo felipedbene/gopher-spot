@@ -80,7 +80,10 @@ mod tests {
                 Entry::Info(s) => s.clone(),
                 Entry::Link { display, .. } => display.clone(),
             };
-            assert!(s.is_ascii(), "non-ASCII display would break MacRoman: {s:?}");
+            assert!(
+                s.is_ascii(),
+                "non-ASCII display would break MacRoman: {s:?}"
+            );
             assert!(s.len() <= MAX_WIDTH, "display over {MAX_WIDTH} cols: {s:?}");
         }
     }
@@ -88,7 +91,10 @@ mod tests {
     #[test]
     fn root_gph_has_the_five_items_and_no_tabs() {
         let gph = root_gph();
-        assert!(!gph.contains('\t'), "gophermap uses [] lines, never raw tabs");
+        assert!(
+            !gph.contains('\t'),
+            "gophermap uses [] lines, never raw tabs"
+        );
         assert!(gph.contains("[1|Now Playing|/spot/now|server|port]"));
         assert!(gph.contains("[7|Buscar|/spot/search|server|port]"));
         assert!(gph.contains("[1|Minhas playlists|/spot/playlists|server|port]"));

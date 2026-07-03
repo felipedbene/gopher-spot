@@ -45,11 +45,26 @@ COPY docker/gopher-server-entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod 0755 /usr/local/bin/entrypoint.sh
 
 # Bake the static root menu, and the /spot dcgi wrapper geomyidae execs.
-RUN mkdir -p /srv/spot \
+#
+# Two entry points, same binary:
+#   /srv/spot/index.dcgi  — human menus. geomyidae interprets stdout as a
+#                           gophermap (.dcgi -> handledcgi). Latin-1 at the edge.
+#   /srv/spot/api/index.cgi — the machine API (/spot/api/*). A .cgi, so geomyidae
+#                           pipes stdout to the socket VERBATIM (handlecgi) — the
+#                           only way the API's tabs + UTF-8 survive. geomyidae's
+#                           REST walk resolves /spot/api/1/* into /srv/spot/api and
+#                           finds index.cgi (index.cgi precedes index.dcgi in its
+#                           search, and only lives here, so human /spot/* is
+#                           unaffected). The binary itself emits raw UTF-8 for
+#                           /spot/api/* (see main.rs), so this wrapper is a plain
+#                           exec — identical to the dcgi one.
+RUN mkdir -p /srv/spot/api \
  && /usr/local/bin/gopher-spot root > /srv/index.gph \
  && printf '%s\n' '#!/bin/sh' 'exec /usr/local/bin/gopher-spot dcgi "$@"' \
       > /srv/spot/index.dcgi \
- && chmod 0755 /srv/spot/index.dcgi \
+ && printf '%s\n' '#!/bin/sh' 'exec /usr/local/bin/gopher-spot dcgi "$@"' \
+      > /srv/spot/api/index.cgi \
+ && chmod 0755 /srv/spot/index.dcgi /srv/spot/api/index.cgi \
  # stream.pls is written at startup from $AUDIO_STREAM_URL, so nobody must own
  # the dir it lives in.
  && chown -R nobody:nobody /srv/spot

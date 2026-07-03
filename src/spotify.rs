@@ -107,6 +107,10 @@ pub struct Device {
     pub name: String,
     #[serde(default)]
     pub is_active: bool,
+    /// The device's current volume (0-100). Absent for devices that don't report
+    /// it (e.g. some Connect endpoints); surfaced as the API `volume` key.
+    #[serde(default)]
+    pub volume_percent: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -176,6 +180,9 @@ pub trait SpotifyApi {
     /// Start playback of a URI on the `gopher-spot` device.
     fn play(&self, uri: &str) -> Result<(), ApiError>;
     fn control(&self, cmd: Control) -> Result<(), ApiError>;
+    /// Seek the current track to `position_ms` (`PUT /v1/me/player/seek`). The
+    /// caller clamps to the track duration; this just issues the command.
+    fn seek(&self, position_ms: u64) -> Result<(), ApiError>;
     /// The user's playlists, paginated (offset in items).
     fn playlists(&self, offset: u32) -> Result<PlaylistsPage, ApiError>;
     /// A playlist's tracks, paginated.
@@ -207,9 +214,9 @@ mod net {
     const TOKEN_URL: &str = "https://accounts.spotify.com/api/token";
     const DEVICE_NAME: &str = "gopher-spot";
     const SEARCH_TTL: i64 = 300; // 5 min
-    // Spotify's /v1/search rejects limit=20 with 400 "Invalid limit" (the docs
-    // still say 0-50, but 20 empirically 400s and 10 works — an API quirk). 10 is
-    // plenty for a Gopher menu.
+                                 // Spotify's /v1/search rejects limit=20 with 400 "Invalid limit" (the docs
+                                 // still say 0-50, but 20 empirically 400s and 10 works — an API quirk). 10 is
+                                 // plenty for a Gopher menu.
     const SEARCH_LIMIT: u32 = 10;
     const DEVICES_TTL: i64 = 30; // 30 s
     const PLAYLISTS_TTL: i64 = 60; // 60 s
@@ -336,7 +343,13 @@ mod net {
                 .into_json()
                 .map_err(|e| format!("token parse failed: {e}"))?;
             let ttl = (tok.expires_in - 60).max(30);
-            cache::put(&self.state_dir, "access_token", self.now_unix, ttl, &tok.access_token);
+            cache::put(
+                &self.state_dir,
+                "access_token",
+                self.now_unix,
+                ttl,
+                &tok.access_token,
+            );
             Ok(tok.access_token)
         }
 
@@ -363,7 +376,8 @@ mod net {
             // body — but it must still be sent as `""` (Content-Length: 0), NOT via
             // `.call()`, which omits the header entirely and triggers the 411.
             let res = if method == "PUT" {
-                req.set("Content-Type", "application/json").send_string("{}")
+                req.set("Content-Type", "application/json")
+                    .send_string("{}")
             } else {
                 req.send_string("")
             };
@@ -387,7 +401,10 @@ mod net {
             let body = if let Some(c) = cache::get(&self.state_dir, "devices", self.now_unix) {
                 c
             } else {
-                let s = self.get("/v1/me/player/devices")?.into_string().map_err(|e| e.to_string())?;
+                let s = self
+                    .get("/v1/me/player/devices")?
+                    .into_string()
+                    .map_err(|e| e.to_string())?;
                 cache::put(&self.state_dir, "devices", self.now_unix, DEVICES_TTL, &s);
                 s
             };
@@ -403,9 +420,15 @@ mod net {
             // is actually the active one. 204 No Content == no active device.
             let resp = self.get("/v1/me/player")?;
             if resp.status() == 204 {
-                return Ok(Playing { is_playing: false, progress_ms: 0, item: None, device: None });
+                return Ok(Playing {
+                    is_playing: false,
+                    progress_ms: 0,
+                    item: None,
+                    device: None,
+                });
             }
-            resp.into_json().map_err(|e| format!("now-playing parse failed: {e}"))
+            resp.into_json()
+                .map_err(|e| format!("now-playing parse failed: {e}"))
         }
 
         fn queue(&self) -> Result<Vec<Track>, ApiError> {
@@ -418,7 +441,9 @@ mod net {
                 #[serde(default = "Vec::new")]
                 queue: Vec<Track>,
             }
-            let q: RawQueue = resp.into_json().map_err(|e| format!("queue parse failed: {e}"))?;
+            let q: RawQueue = resp
+                .into_json()
+                .map_err(|e| format!("queue parse failed: {e}"))?;
             Ok(q.queue)
         }
 
@@ -476,6 +501,13 @@ mod net {
             }
         }
 
+        fn seek(&self, position_ms: u64) -> Result<(), ApiError> {
+            self.command(
+                "PUT",
+                &format!("/v1/me/player/seek?position_ms={position_ms}"),
+            )
+        }
+
         fn playlists(&self, offset: u32) -> Result<PlaylistsPage, ApiError> {
             let body = self.get_cached(
                 &format!("playlists:{offset}"),
@@ -483,7 +515,11 @@ mod net {
                 &format!("/v1/me/playlists?limit={PAGE_SIZE}&offset={offset}"),
             )?;
             let raw: RawPlaylists = serde_json::from_str(&body).map_err(|e| e.to_string())?;
-            Ok(PlaylistsPage { items: raw.items, total: raw.total, offset })
+            Ok(PlaylistsPage {
+                items: raw.items,
+                total: raw.total,
+                offset,
+            })
         }
 
         fn playlist_tracks(&self, id: &str, offset: u32) -> Result<TracksPage, ApiError> {
@@ -494,14 +530,26 @@ mod net {
             )?;
             let raw: RawPlTracks = serde_json::from_str(&body).map_err(|e| e.to_string())?;
             let items = raw.items.into_iter().filter_map(|i| i.track).collect();
-            Ok(TracksPage { items, total: raw.total, offset })
+            Ok(TracksPage {
+                items,
+                total: raw.total,
+                offset,
+            })
         }
 
         fn album(&self, id: &str) -> Result<AlbumDetail, ApiError> {
-            let body =
-                self.get_cached(&format!("album:{id}"), CATALOG_TTL, &format!("/v1/albums/{id}"))?;
+            let body = self.get_cached(
+                &format!("album:{id}"),
+                CATALOG_TTL,
+                &format!("/v1/albums/{id}"),
+            )?;
             let r: RawAlbum = serde_json::from_str(&body).map_err(|e| e.to_string())?;
-            Ok(AlbumDetail { name: r.name, uri: r.uri, artists: r.artists, total: r.tracks.total })
+            Ok(AlbumDetail {
+                name: r.name,
+                uri: r.uri,
+                artists: r.artists,
+                total: r.tracks.total,
+            })
         }
 
         fn album_tracks(&self, id: &str, offset: u32) -> Result<TracksPage, ApiError> {
@@ -511,12 +559,19 @@ mod net {
                 &format!("/v1/albums/{id}/tracks?limit={PAGE_SIZE}&offset={offset}"),
             )?;
             let r: RawAlbumTracks = serde_json::from_str(&body).map_err(|e| e.to_string())?;
-            Ok(TracksPage { items: r.items, total: r.total, offset })
+            Ok(TracksPage {
+                items: r.items,
+                total: r.total,
+                offset,
+            })
         }
 
         fn artist(&self, id: &str) -> Result<Artist, ApiError> {
-            let body =
-                self.get_cached(&format!("artist:{id}"), CATALOG_TTL, &format!("/v1/artists/{id}"))?;
+            let body = self.get_cached(
+                &format!("artist:{id}"),
+                CATALOG_TTL,
+                &format!("/v1/artists/{id}"),
+            )?;
             serde_json::from_str(&body).map_err(|e| format!("artist parse failed: {e}"))
         }
 
@@ -529,7 +584,11 @@ mod net {
                 ),
             )?;
             let r: RawArtistAlbums = serde_json::from_str(&body).map_err(|e| e.to_string())?;
-            Ok(AlbumsPage { items: r.items, total: r.total, offset })
+            Ok(AlbumsPage {
+                items: r.items,
+                total: r.total,
+                offset,
+            })
         }
 
         fn artist_top_tracks(&self, id: &str) -> Result<Vec<Track>, ApiError> {
@@ -584,7 +643,12 @@ mod net {
             .iter()
             .find(|d| d.name == DEVICE_NAME)
             .and_then(|d| d.id.clone())
-            .or_else(|| devices.iter().find(|d| d.is_active).and_then(|d| d.id.clone()))
+            .or_else(|| {
+                devices
+                    .iter()
+                    .find(|d| d.is_active)
+                    .and_then(|d| d.id.clone())
+            })
             .or_else(|| devices.iter().find_map(|d| d.id.clone()))
             .ok_or_else(|| {
                 format!("nenhum device ativo (abra o Spotify no device '{DEVICE_NAME}')")
@@ -602,7 +666,12 @@ mod net {
         }
 
         fn dev(name: &str, id: Option<&str>, active: bool) -> Device {
-            Device { id: id.map(String::from), name: name.into(), is_active: active }
+            Device {
+                id: id.map(String::from),
+                name: name.into(),
+                is_active: active,
+                volume_percent: None,
+            }
         }
 
         #[test]
@@ -616,7 +685,10 @@ mod net {
 
         #[test]
         fn device_pick_falls_back_to_active_then_first() {
-            let active = vec![dev("iPhone", Some("aa"), true), dev("Echo", Some("cc"), false)];
+            let active = vec![
+                dev("iPhone", Some("aa"), true),
+                dev("Echo", Some("cc"), false),
+            ];
             assert_eq!(pick_device(&active).unwrap(), "aa");
             let first = vec![dev("Echo", Some("cc"), false)];
             assert_eq!(pick_device(&first).unwrap(), "cc");

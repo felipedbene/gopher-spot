@@ -36,7 +36,10 @@ pub fn get(dir: &Path, key: &str, now_unix: i64) -> Option<String> {
 /// a write failure just means a cache miss next time.
 pub fn put(dir: &Path, key: &str, now_unix: i64, ttl_secs: i64, payload: &str) {
     let _ = std::fs::create_dir_all(dir);
-    let _ = std::fs::write(key_file(dir, key), format!("{}\n{}", now_unix + ttl_secs, payload));
+    let _ = std::fs::write(
+        key_file(dir, key),
+        format!("{}\n{}", now_unix + ttl_secs, payload),
+    );
 }
 
 #[cfg(test)]

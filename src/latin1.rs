@@ -23,9 +23,9 @@ pub fn encode(s: &str) -> Vec<u8> {
         } else {
             // Fold the punctuation Spotify uses a lot to ASCII rather than '?'.
             match cp {
-                0x2018 | 0x2019 => out.push(b'\''), // ' '
-                0x201C | 0x201D => out.push(b'"'),  // " "
-                0x2013 | 0x2014 => out.push(b'-'),  // en / em dash
+                0x2018 | 0x2019 => out.push(b'\''),      // ' '
+                0x201C | 0x201D => out.push(b'"'),       // " "
+                0x2013 | 0x2014 => out.push(b'-'),       // en / em dash
                 0x2026 => out.extend_from_slice(b"..."), // ellipsis
                 _ => out.push(b'?'),
             }

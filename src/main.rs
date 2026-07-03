@@ -25,7 +25,17 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("dcgi") => {
-            emit(&run_dcgi(&args[2..]));
+            let (body, is_api) = run_dcgi(&args[2..]);
+            if is_api {
+                // The machine API is a type-0 text document of `key<TAB>value`
+                // lines in UTF-8, served RAW by geomyidae's .cgi (verbatim to the
+                // socket). It must NOT get the human menus' Latin-1 transcode — that
+                // would corrupt non-Latin-1 names and is the wrong charset for the
+                // contract — and its tabs must survive. So write the bytes as-is.
+                let _ = std::io::stdout().write_all(body.as_bytes());
+            } else {
+                emit(&body);
+            }
             ExitCode::SUCCESS
         }
         #[cfg(feature = "net")]
@@ -49,32 +59,39 @@ fn emit(gph: &str) {
     let _ = std::io::stdout().write_all(&bytes);
 }
 
-/// Route a dcgi request. On the `net` build we try to construct a live Spotify
-/// client from the OAuth env (the Secret); if it's absent, `route` gets `None`
-/// and serves the offline mock menus.
-fn run_dcgi(rest: &[String]) -> String {
+/// Route a dcgi request, returning `(body, is_api)`. `is_api` selects the output
+/// encoding at the stdout edge: `/spot/api/*` is raw UTF-8 (tab-delimited type-0),
+/// everything else is a transcoded gophermap. On the `net` build we try to build a
+/// live Spotify client from the OAuth env (the Secret); if it's absent, `route`
+/// gets `None` and serves the offline mock menus.
+fn run_dcgi(rest: &[String]) -> (String, bool) {
     let a = dcgi::DcgiArgs::from_argv(rest);
+    let path = a.path();
+    let is_api = path == "/spot/api" || path.starts_with("/spot/api/");
+    let now_ms = now_unix_ms();
 
     #[cfg(feature = "net")]
-    {
+    let body = {
         use gopher_spot::spotify::{Client, SpotifyApi};
-        let state = std::env::var("SPOT_STATE_DIR").unwrap_or_else(|_| "/var/cache/spot".to_string());
-        let client = Client::from_env(now_unix(), std::path::PathBuf::from(state));
-        dcgi::route(&a, client.as_ref().map(|c| c as &dyn SpotifyApi))
-    }
+        let state =
+            std::env::var("SPOT_STATE_DIR").unwrap_or_else(|_| "/var/cache/spot".to_string());
+        let client = Client::from_env(now_ms / 1000, std::path::PathBuf::from(state));
+        dcgi::route(&a, client.as_ref().map(|c| c as &dyn SpotifyApi), now_ms)
+    };
 
     #[cfg(not(feature = "net"))]
-    {
-        dcgi::route(&a, None)
-    }
+    let body = dcgi::route(&a, None, now_ms);
+
+    (body, is_api)
 }
 
-#[cfg(feature = "net")]
-fn now_unix() -> i64 {
+/// Wall-clock as unix epoch milliseconds — the API snapshot `ts` (and, /1000, the
+/// token-cache clock).
+fn now_unix_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
+        .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
 }
 
