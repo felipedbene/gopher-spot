@@ -215,6 +215,78 @@ Track search. Returns a v1 **list** (same `item.<i>.*` shape as `/queue`), with
   "limit 20" was dropped for this hard Spotify constraint; a client must not
   assume a fixed count.)
 
+### Playlists (added in fio S3/5)
+
+```
+/spot/api/1/playlists
+/spot/api/1/playlists?offset=<n>
+```
+
+The user's playlists as an indexed list, paginated via `?offset=` (20/page):
+
+| key                   | when     | value                                       |
+|-----------------------|----------|---------------------------------------------|
+| `api`                 | always   | `1`                                         |
+| `result_len`          | always   | playlists in this response                  |
+| `total`               | always   | grand total (for paging)                    |
+| `offset`              | always   | this page's offset                          |
+| `item.<i>.id`         | per item | playlist id — feed to `/playlists/<id>`     |
+| `item.<i>.name`       | per item | playlist name                               |
+| `item.<i>.tracks_len` | per item | track count (see the caveat below)          |
+| `ts`                  | always   | unix epoch **ms**                            |
+
+Playlists with no id are omitted (a client can't open them). `result_len` counts
+what's emitted; `total` is Spotify's grand total.
+
+```
+/spot/api/1/playlists/<id>
+/spot/api/1/playlists/<id>?offset=<n>
+```
+
+A playlist's tracks in the **`/search` list shape**, led by a `name` header:
+
+| key                    | when     | value                                    |
+|------------------------|----------|------------------------------------------|
+| `api`                  | always   | `1`                                      |
+| `name`                 | always   | the playlist's display name              |
+| `result_len`           | always   | tracks in this response                  |
+| `total` / `offset`     | always   | paging                                   |
+| `item.<i>.*`           | per item | same block as `/search` / `/queue`       |
+| `ts`                   | always   | unix epoch **ms**                         |
+
+- Unknown id → `not_found`.
+- A playlist Spotify won't let this app read → **`forbidden`** (see below).
+
+> **⚠ Empirical reality (fio S3/5 Phase 0).** For this app+token, **every**
+> `/v1/playlists/{id}/tracks` returns **HTTP 403 — including the user's own
+> playlists** — and `tracks.total` reports `0`. This is Spotify's Nov-2024
+> dev-mode restriction on playlist track reads (the token *does* hold
+> `playlist-read-private`, so it is **not** a scope gap, and it is **not**
+> fixable client-side). Verified against the live account. Consequence: today
+> `/playlists` lists names/ids fine, but `/playlists/<id>` almost always returns
+> `forbidden` and `tracks_len` is `0`. The endpoint is implemented correctly and
+> will start returning tracks the moment the app gains extended quota (or Spotify
+> lifts the block); until then a client should expect `forbidden` and fall back to
+> **playing the playlist as a context** (below), which does **not** require track
+> read access.
+
+### Playing a context (added in fio S3/5)
+
+Context playback is triggered on the **human** `/spot/play` selector (the same one
+the client already uses for single tracks — it returns a gophermap, not a v1
+document), extended additively:
+
+```
+/spot/play?context_uri=<album|playlist|artist uri>&offset=<i>
+```
+
+Starts track `i` (0-based) **within** that context, so `next`/`prev` follow the
+album/playlist order instead of the autoplay radio. The existing single-track
+`/spot/play?uri=<track uri>` is unchanged. Unlike reading a playlist's tracks,
+starting a playlist **context** works even where `/playlists/<id>` is `forbidden`
+(playback resolves server-side and needs no track-read access). Poll `/spot/api/1/now`
+for the resulting state.
+
 ### Cover (added in fio S2)
 
 ```
@@ -248,8 +320,9 @@ message	<english description>
 
 Codes: `bad_range`, `bad_uri`, `bad_query` (fio S3/4: empty search `q`),
 `no_track`, `no_device` (fio S3/3: `wake` found no registered gopher-spot
-device), `not_found`, `upstream` (a Spotify/transport failure, or the OAuth Secret
-not being configured). `message`
+device), `not_found`, `forbidden` (fio S3/5: Spotify blocks this app from reading
+the playlist — distinct from `not_found`; the playlist exists), `upstream` (a
+Spotify/transport failure, or the OAuth Secret not being configured). `message`
 is human-readable English and **not** part of the stable contract — switch on
 `error`, not on text.
 

@@ -248,6 +248,34 @@ fn artist_albums(id: &str, args: &DcgiArgs, api: Option<&dyn SpotifyApi>) -> Str
 }
 
 fn play(args: &DcgiArgs, api: Option<&dyn SpotifyApi>) -> String {
+    // Context play (fio S3/5): ?context_uri=<album|playlist|artist uri>&offset=<i>
+    // starts track i WITHIN that context, so next/prev follow the album/playlist
+    // order instead of the autoplay radio. Additive — the ?uri= single-track path
+    // below (what fio 9 already uses) is untouched.
+    if let Some(ctx) = args.query("context_uri").filter(|u| !u.is_empty()) {
+        let offset = args
+            .query("offset")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        return match api {
+            Some(a) => match a.play_context(&ctx, offset) {
+                Ok(()) => page(vec![
+                    info("Tocando contexto no gopher-spot..."),
+                    info(clip(&format!("{ctx} (faixa {offset})"))),
+                    info(""),
+                    info("(next/prev seguem a ordem do album/playlist)"),
+                    info(""),
+                    link(ItemKind::Menu, "Now Playing", "/spot/now"),
+                    link(ItemKind::Menu, "Voltar ao menu", "/"),
+                ]),
+                Err(e) => page(error_entries(&e)),
+            },
+            None => mock(
+                "Tocar",
+                &format!("(mock) tocaria contexto {ctx} @ {offset}"),
+            ),
+        };
+    }
     let uri = match args.query("uri") {
         Some(u) if !u.is_empty() => u,
         _ => return page(error_entries("play sem ?uri=")),
@@ -804,7 +832,7 @@ fn urldecode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spotify::{Album, ApiError, Artist, Page, Playlist};
+    use crate::spotify::{Album, ApiError, Artist, Page, Playlist, PlaylistTracksRef};
 
     fn argv(search: &str, selector: &str) -> Vec<String> {
         let (_sel, arguments) = selector.split_once('?').unwrap_or((selector, ""));
@@ -879,6 +907,12 @@ mod tests {
         fn play(&self, _uri: &str) -> Result<(), ApiError> {
             Ok(())
         }
+        fn play_context(&self, _c: &str, _o: u32) -> Result<(), ApiError> {
+            Ok(())
+        }
+        fn playlist_name(&self, id: &str) -> Result<String, ApiError> {
+            Ok(format!("PL {id}"))
+        }
         fn wake(&self, _play: bool) -> Result<(), ApiError> {
             Ok(())
         }
@@ -896,6 +930,7 @@ mod tests {
                 .map(|i| Playlist {
                     id: Some(format!("pl{}", offset + i)),
                     name: format!("Playlist {}", offset + i),
+                    tracks: PlaylistTracksRef::default(),
                 })
                 .collect();
             Ok(PlaylistsPage {
@@ -1133,6 +1168,23 @@ mod tests {
         let out = r("", "/spot/play?uri=spotify:track:abc", Some(&f));
         assert!(out.contains("Mandando tocar"));
         assert!(out.contains("spotify:track:abc"));
+    }
+
+    #[test]
+    fn play_context_uri_starts_context_at_offset() {
+        // fio S3/5: ?context_uri=&offset= plays a context (album/playlist) so
+        // next/prev follow its order. The ?uri= single-track path is untouched.
+        let f = fake();
+        let out = r(
+            "",
+            "/spot/play?context_uri=spotify:playlist:pl1&offset=3",
+            Some(&f),
+        );
+        assert!(out.contains("Tocando contexto"));
+        assert!(out.contains("spotify:playlist:pl1 (faixa 3)"));
+        // A bare ?uri= still goes the single-track route.
+        let out2 = r("", "/spot/play?uri=spotify:track:abc", Some(&f));
+        assert!(out2.contains("Mandando tocar"));
     }
 
     #[test]

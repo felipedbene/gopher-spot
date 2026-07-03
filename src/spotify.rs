@@ -126,10 +126,20 @@ pub struct Device {
     pub volume_percent: Option<u32>,
 }
 
+/// The nested `tracks` object on a playlist list item — we only need its `total`
+/// (the API `tracks_len`). Defaults to 0 when Spotify omits or restricts it.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PlaylistTracksRef {
+    #[serde(default)]
+    pub total: u32,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Playlist {
     pub id: Option<String>,
     pub name: String,
+    #[serde(default)]
+    pub tracks: PlaylistTracksRef,
 }
 
 /// How many items per page (PROMPT: 20/página).
@@ -229,10 +239,19 @@ pub trait SpotifyApi {
     /// Seek the current track to `position_ms` (`PUT /v1/me/player/seek`). The
     /// caller clamps to the track duration; this just issues the command.
     fn seek(&self, position_ms: u64) -> Result<(), ApiError>;
+    /// Play an album/playlist/artist **context** starting at track `offset`
+    /// (`PUT /v1/me/player/play` with `context_uri` + `offset.position`), so
+    /// next/prev follow that order instead of the autoplay radio. Distinct from
+    /// `play(uri)`, which plays a single track with no context.
+    fn play_context(&self, context_uri: &str, offset: u32) -> Result<(), ApiError>;
     /// The user's playlists, paginated (offset in items).
     fn playlists(&self, offset: u32) -> Result<PlaylistsPage, ApiError>;
     /// A playlist's tracks, paginated.
     fn playlist_tracks(&self, id: &str, offset: u32) -> Result<TracksPage, ApiError>;
+    /// A playlist's display name (`GET /v1/playlists/{id}?fields=name`). Cheap and
+    /// still readable even where `/tracks` is blocked; used for the API playlist
+    /// header and to distinguish an unknown id (404) from a blocked one (403).
+    fn playlist_name(&self, id: &str) -> Result<String, ApiError>;
     /// Album header (title, artists, track count) for a detail page.
     fn album(&self, id: &str) -> Result<AlbumDetail, ApiError>;
     /// An album's tracks, paginated.
@@ -509,7 +528,13 @@ mod net {
                 .get("/v1/me/player/devices")?
                 .into_string()
                 .map_err(|e| e.to_string())?;
-            cache::put(&self.state_dir, "devices", self.now_unix, DEVICES_TTL, &body);
+            cache::put(
+                &self.state_dir,
+                "devices",
+                self.now_unix,
+                DEVICES_TTL,
+                &body,
+            );
             let devices: Devices = serde_json::from_str(&body).map_err(|e| e.to_string())?;
             devices
                 .devices
@@ -672,6 +697,43 @@ mod net {
                 "PUT",
                 &format!("/v1/me/player/seek?position_ms={position_ms}"),
             )
+        }
+
+        fn play_context(&self, context_uri: &str, offset: u32) -> Result<(), ApiError> {
+            let device = self.device_id()?;
+            let token = self.access_token()?;
+            // offset.position is the 0-based index of the track to start on within
+            // the context; the player then advances through the context in order.
+            let body = serde_json::json!({
+                "context_uri": context_uri,
+                "offset": { "position": offset },
+            })
+            .to_string();
+            self.agent
+                .put(&format!("{API}/v1/me/player/play?device_id={device}"))
+                .set("Authorization", &format!("Bearer {token}"))
+                .set("Content-Type", "application/json")
+                .send_string(&body)
+                .map(|_| ())
+                .map_err(api_err)
+        }
+
+        fn playlist_name(&self, id: &str) -> Result<String, ApiError> {
+            #[derive(Deserialize)]
+            struct NameOnly {
+                #[serde(default)]
+                name: String,
+            }
+            // ?fields=name keeps the body tiny and stays readable even when the
+            // full object / tracks are blocked. A 404 here => unknown id; a 403 =>
+            // blocked — the API layer maps each distinctly.
+            let body = self.get_cached(
+                &format!("plname:{id}"),
+                PLAYLISTS_TTL,
+                &format!("/v1/playlists/{id}?fields=name"),
+            )?;
+            let n: NameOnly = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+            Ok(n.name)
         }
 
         fn playlists(&self, offset: u32) -> Result<PlaylistsPage, ApiError> {
@@ -925,9 +987,21 @@ mod tests {
     #[test]
     fn pick_image_prefers_smallest_ge_then_largest() {
         let imgs = vec![
-            Image { url: "big".into(), height: Some(640), width: Some(640) },
-            Image { url: "mid".into(), height: Some(300), width: Some(300) },
-            Image { url: "sm".into(), height: Some(64), width: Some(64) },
+            Image {
+                url: "big".into(),
+                height: Some(640),
+                width: Some(640),
+            },
+            Image {
+                url: "mid".into(),
+                height: Some(300),
+                width: Some(300),
+            },
+            Image {
+                url: "sm".into(),
+                height: Some(64),
+                width: Some(64),
+            },
         ];
         // exact / smallest-at-least matches
         assert_eq!(pick_image(&imgs, 64).unwrap().url, "sm");

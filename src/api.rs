@@ -20,7 +20,7 @@
 //!     the client leaves with current state in one round-trip.
 
 use crate::dcgi::DcgiArgs;
-use crate::spotify::{Control, Playing, SpotifyApi, Track};
+use crate::spotify::{Control, Playing, PlaylistsPage, SpotifyApi, Track, TracksPage};
 
 /// The contract version, emitted as the leading `api` key on every response.
 pub const API_VERSION: u32 = 1;
@@ -64,6 +64,10 @@ pub fn route(path: &str, args: &DcgiArgs, api: Option<&dyn SpotifyApi>, now_ms: 
         "queue/add" => queue_add(api, args, now_ms),
         "wake" => wake(api, args, now_ms),
         "search" => search_doc(api, args, now_ms),
+        "playlists" => playlists_doc(api, args, now_ms),
+        s if s.starts_with("playlists/") => {
+            playlist_tracks_doc(api, args, &s["playlists/".len()..], now_ms)
+        }
         other => error("not_found", &format!("unknown endpoint: {other}")),
     };
     text.into_bytes()
@@ -126,6 +130,92 @@ fn search_snapshot(tracks: &[Track], now_ms: i64) -> String {
     kv(&mut out, "result_len", &tracks.len().to_string());
     for (i, t) in tracks.iter().enumerate() {
         push_item(&mut out, i, t);
+    }
+    kv(&mut out, "ts", &now_ms.to_string());
+    out
+}
+
+/// `/playlists`: the user's playlists as an indexed list (`item.<i>.{id,name,
+/// tracks_len}`), paginated via `?offset=`. `total`/`offset` let the client page.
+/// Only playlists that carry an id are emitted (a client needs it to open one).
+fn playlists_doc(api: &dyn SpotifyApi, args: &DcgiArgs, now_ms: i64) -> String {
+    let offset = args
+        .query("offset")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    match api.playlists(offset) {
+        Ok(p) => playlists_snapshot(&p, now_ms),
+        Err(e) => error("upstream", &e),
+    }
+}
+
+fn playlists_snapshot(p: &PlaylistsPage, now_ms: i64) -> String {
+    let items: Vec<&crate::spotify::Playlist> =
+        p.items.iter().filter(|pl| pl.id.is_some()).collect();
+    let mut out = String::new();
+    kv(&mut out, "api", &API_VERSION.to_string());
+    kv(&mut out, "result_len", &items.len().to_string());
+    kv(&mut out, "total", &p.total.to_string());
+    kv(&mut out, "offset", &p.offset.to_string());
+    for (i, pl) in items.iter().enumerate() {
+        kv(&mut out, &format!("item.{i}.id"), pl.id.as_deref().unwrap());
+        kv(&mut out, &format!("item.{i}.name"), &pl.name);
+        kv(
+            &mut out,
+            &format!("item.{i}.tracks_len"),
+            &pl.tracks.total.to_string(),
+        );
+    }
+    kv(&mut out, "ts", &now_ms.to_string());
+    out
+}
+
+/// `/playlists/<id>`: a playlist's tracks in the `/search` list shape, led by a
+/// `name` header. Unknown id -> `not_found`; a playlist Spotify won't let this app
+/// read -> `forbidden` (the Nov-2024 dev-mode block — see API.md). Paginated via
+/// `?offset=`.
+fn playlist_tracks_doc(api: &dyn SpotifyApi, args: &DcgiArgs, id: &str, now_ms: i64) -> String {
+    let id = id.trim_end_matches('/');
+    let offset = args
+        .query("offset")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    // Name first: readable even where /tracks is blocked, and its 404 vs 403 is
+    // how we tell an unknown id from a blocked-but-real one.
+    let name = match api.playlist_name(id) {
+        Ok(n) => n,
+        Err(e) => return map_playlist_err(&e),
+    };
+    match api.playlist_tracks(id, offset) {
+        Ok(t) => playlist_tracks_snapshot(&name, &t, now_ms),
+        Err(e) => map_playlist_err(&e),
+    }
+}
+
+/// Map a playlist upstream error to a v1 code: 404 -> `not_found` (unknown id),
+/// 403 -> `forbidden` (Spotify blocks this app from reading it), else `upstream`.
+fn map_playlist_err(e: &str) -> String {
+    if e.contains("HTTP 404") {
+        error("not_found", "unknown playlist")
+    } else if e.contains("HTTP 403") {
+        error(
+            "forbidden",
+            "spotify does not allow this app to read this playlist",
+        )
+    } else {
+        error("upstream", e)
+    }
+}
+
+fn playlist_tracks_snapshot(name: &str, t: &TracksPage, now_ms: i64) -> String {
+    let mut out = String::new();
+    kv(&mut out, "api", &API_VERSION.to_string());
+    kv(&mut out, "name", name);
+    kv(&mut out, "result_len", &t.items.len().to_string());
+    kv(&mut out, "total", &t.total.to_string());
+    kv(&mut out, "offset", &t.offset.to_string());
+    for (i, tr) in t.items.iter().enumerate() {
+        push_item(&mut out, i, tr);
     }
     kv(&mut out, "ts", &now_ms.to_string());
     out
@@ -379,7 +469,8 @@ fn kv(out: &mut String, key: &str, value: &str) {
 mod tests {
     use super::*;
     use crate::spotify::{Album, ApiError, Artist, Device, Page, SearchResults, Track};
-    use crate::spotify::{AlbumDetail, AlbumsPage, PlaylistsPage, TracksPage};
+    use crate::spotify::{AlbumDetail, AlbumsPage, Playlist, PlaylistTracksRef};
+    use crate::spotify::{PlaylistsPage, TracksPage};
     use std::cell::RefCell;
 
     fn argv(selector: &str) -> Vec<String> {
@@ -545,11 +636,48 @@ mod tests {
             *self.last_wake.borrow_mut() = Some(play);
             Ok(())
         }
-        fn playlists(&self, _o: u32) -> Result<PlaylistsPage, ApiError> {
-            unimplemented!()
+        fn play_context(&self, _c: &str, _o: u32) -> Result<(), ApiError> {
+            Ok(())
         }
-        fn playlist_tracks(&self, _id: &str, _o: u32) -> Result<TracksPage, ApiError> {
-            unimplemented!()
+        fn playlists(&self, offset: u32) -> Result<PlaylistsPage, ApiError> {
+            Ok(PlaylistsPage {
+                items: vec![
+                    Playlist {
+                        id: Some("pl1".into()),
+                        name: "Sambas".into(),
+                        tracks: PlaylistTracksRef { total: 12 },
+                    },
+                    Playlist {
+                        id: Some("pl2".into()),
+                        name: "MPB".into(),
+                        tracks: PlaylistTracksRef { total: 40 },
+                    },
+                    // No id -> must be filtered out of the doc.
+                    Playlist {
+                        id: None,
+                        name: "sem id".into(),
+                        tracks: PlaylistTracksRef::default(),
+                    },
+                ],
+                total: 25,
+                offset,
+            })
+        }
+        fn playlist_tracks(&self, id: &str, offset: u32) -> Result<TracksPage, ApiError> {
+            if id == "blocked" {
+                return Err("spotify HTTP 403: Forbidden".into());
+            }
+            Ok(TracksPage {
+                items: vec![track("Faixa da playlist")],
+                total: 1,
+                offset,
+            })
+        }
+        fn playlist_name(&self, id: &str) -> Result<String, ApiError> {
+            match id {
+                "ghost" => Err("spotify HTTP 404: not found".into()),
+                _ => Ok(format!("Playlist {id}")),
+            }
         }
         fn album(&self, _id: &str) -> Result<AlbumDetail, ApiError> {
             unimplemented!()
@@ -806,10 +934,7 @@ mod tests {
             call_bytes(&f, "/spot/api/1/cover/al1/64"),
             vec![0xFF, 0xD8, 0xFF, 64, 0x00, 0xFF, 0xD9]
         );
-        assert_eq!(
-            call_bytes(&f, "/spot/api/1/cover/al1/300")[3],
-            300u32 as u8
-        );
+        assert_eq!(call_bytes(&f, "/spot/api/1/cover/al1/300")[3], 300u32 as u8);
         assert_eq!(call_bytes(&f, "/spot/api/1/cover/al1/640")[3], 640u32 as u8);
     }
 
@@ -870,8 +995,8 @@ mod tests {
     fn command_busts_now_cache_within_window() {
         let f = fake(playing_track());
         now_at(&f, TS); // fetch #1, caches until TS+1000
-        // A command mid-window must invalidate: without the bust, `next`'s reply
-        // would read the still-valid cached snapshot (no fetch) -> count 1.
+                        // A command mid-window must invalidate: without the bust, `next`'s reply
+                        // would read the still-valid cached snapshot (no fetch) -> count 1.
         let args = DcgiArgs::from_argv(&argv("/spot/api/1/next"));
         route(&args.path(), &args, Some(&f), TS + 100);
         assert_eq!(*f.now_calls.borrow(), 2, "command forced a fresh snapshot");
@@ -976,5 +1101,50 @@ mod tests {
         assert!(call(&f, "/spot/api/1/search").contains("error\tbad_query\r\n"));
         // whitespace-only decodes to empty after trim
         assert!(call(&f, "/spot/api/1/search?q=%20%20").contains("error\tbad_query\r\n"));
+    }
+
+    // ---- fio S3/5: playlists --------------------------------------------------
+
+    #[test]
+    fn playlists_list_has_id_name_tracks_len() {
+        let f = fake(playing_track());
+        let out = call(&f, "/spot/api/1/playlists");
+        assert_wire(&out);
+        assert!(out.contains("api\t1\r\n"));
+        assert!(out.contains("result_len\t2\r\n")); // the id-less one is filtered
+        assert!(out.contains("total\t25\r\n"));
+        assert!(out.contains("offset\t0\r\n"));
+        assert!(out.contains("item.0.id\tpl1\r\n"));
+        assert!(out.contains("item.0.name\tSambas\r\n"));
+        assert!(out.contains("item.0.tracks_len\t12\r\n"));
+        assert!(out.contains("item.1.id\tpl2\r\n"));
+        assert!(out.contains("item.1.tracks_len\t40\r\n"));
+        assert!(!out.contains("sem id")); // id-less playlist omitted entirely
+    }
+
+    #[test]
+    fn playlist_tracks_has_name_header_and_items() {
+        let f = fake(playing_track());
+        let out = call(&f, "/spot/api/1/playlists/pl1");
+        assert_wire(&out);
+        assert!(out.contains("name\tPlaylist pl1\r\n")); // the header
+        assert!(out.contains("result_len\t1\r\n"));
+        assert!(out.contains("item.0.track\tFaixa da playlist\r\n"));
+        assert!(out.contains("item.0.uri\tspotify:track:abc123\r\n"));
+    }
+
+    #[test]
+    fn playlist_unknown_id_is_not_found() {
+        // playlist_name 404s for "ghost" -> unknown id.
+        let f = fake(playing_track());
+        assert!(call(&f, "/spot/api/1/playlists/ghost").contains("error\tnot_found\r\n"));
+    }
+
+    #[test]
+    fn playlist_blocked_by_spotify_is_forbidden() {
+        // name readable (200) but /tracks 403 -> forbidden (the dev-mode block).
+        let f = fake(playing_track());
+        let out = call(&f, "/spot/api/1/playlists/blocked");
+        assert!(out.contains("error\tforbidden\r\n"), "{out}");
     }
 }
