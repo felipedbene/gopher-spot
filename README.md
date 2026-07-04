@@ -179,7 +179,7 @@ classDiagram
         <<module — machine API /spot/api/1>>
         now/play/pause/next/prev/volume/seek
         queue, queue/add, cover(JPEG), wake, search
-        playlists, playlists/{id}; ~1s /now micro-cache
+        playlists, playlists/[id]; approx ~1s /now micro-cache
     }
 
     class SpotifyApi {
