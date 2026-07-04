@@ -327,8 +327,9 @@ must be served raw, not interpreted as a menu.
 
 ## The machine API (for the DeToca client)
 
-The human Gopher menus are PT-BR gophermaps meant for a person driving Netscape.
-A second consumer — **DeToca**, a native OS 9 client — needs a stable,
+The human Gopher menus are PT-BR gophermaps meant for a person driving Netscape on
+Mac OS 9. A second consumer — **[DeToca](https://github.com/felipedbene/detoca)**, a
+native **Mac OS X 10.6** client (Snow Leopard, non-ARC Cocoa) — needs a stable,
 machine-parseable surface instead of scraping localized menu text. That's the
 **machine API** at **`/spot/api/1/*`**: a frozen, versioned contract. Full spec in
 [`API.md`](API.md); the shape:
@@ -355,6 +356,11 @@ machine-parseable surface instead of scraping localized menu text. That's the
 Errors are `key<TAB>value` too: `api` / `error <code>` / `message`. Codes:
 `bad_range`, `bad_uri`, `bad_query`, `no_track`, `no_device`, `not_found`,
 `forbidden`, `upstream`.
+
+The DeToca client now consumes this **whole** surface (its *fio 10*): a
+cover-forward player, the "up next" queue with thumbnails, track search, the
+playlists list with context play, and `device`/`wake` recovery — see
+[DeToca's README](https://github.com/felipedbene/detoca#the-full-radinho-fio-10).
 
 > **⚠ handlecgi trap.** geomyidae's `handlecgi` splices the child's **stderr** into
 > the client socket, so any `eprintln!`/panic on an API request path prepends bytes
