@@ -194,7 +194,21 @@ sleep 3
 #      simplest check that distinguishes "server dead" from "nothing playing".
 FIFO=/tmp/spotify.pcm
 [ -p "$FIFO" ] || mkfifo "$FIFO"
+# GS-08: a chain that dies FAST repeatedly (Icecast up but persistently rejecting
+# the source — wrong source password, slots full, mount misconfig) used to
+# respawn every 2s forever, re-logging librespot into Spotify each time (a login
+# storm), while the TCP livenessProbe stayed green because Icecast itself lives.
+# Fast deaths (< FAST_SECS) now back off exponentially (cap 60s), and after
+# MAX_FAST_FAILS in a row the script exits non-zero so the container restart
+# makes the wedge visible to Kubernetes. A healthy run (chain survived >=
+# FAST_SECS — normal cycles live minutes to hours) resets both. Legitimate
+# pause/idle never trips this: ffmpeg blocks on the FIFO instead of exiting.
+FAST_SECS=10
+MAX_FAST_FAILS=10
+FAILS=0
+DELAY=2
 while true; do
+  STARTED=$(date +%s)
   librespot "$@" > "$FIFO" &
   LR=$!
   # `-re` throttles output to real time. For raw PCM (no embedded timestamps) it
@@ -204,8 +218,22 @@ while true; do
   ffmpeg -hide_banner -loglevel warning -re -f s16le -ar 44100 -ac 2 -i "$FIFO" \
          -c:a libmp3lame -b:a "$MP3_BITRATE" -write_xing 0 -f mp3 -legacy_icecast 1 \
          -content_type audio/mpeg "$(ice_url spotify.mp3)" || true
-  echo "audio-stream: live encoder exited, tearing down librespot + respawning in 2s" >&2
   kill "$LR" 2>/dev/null || true
   wait "$LR" 2>/dev/null || true
-  sleep 2
+  if [ $(( $(date +%s) - STARTED )) -ge "$FAST_SECS" ]; then
+    FAILS=0
+    DELAY=2
+  else
+    FAILS=$((FAILS + 1))
+    if [ "$FAILS" -ge "$MAX_FAST_FAILS" ]; then
+      echo "audio-stream: live chain died $FAILS times in <${FAST_SECS}s each while icecast is up -- exiting for a container restart" >&2
+      exit 1
+    fi
+    DELAY=$((DELAY * 2))
+    if [ "$DELAY" -gt 60 ]; then
+      DELAY=60
+    fi
+  fi
+  echo "audio-stream: live encoder exited, tearing down librespot + respawning in ${DELAY}s (fast fails: $FAILS)" >&2
+  sleep "$DELAY"
 done
