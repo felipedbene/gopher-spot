@@ -77,7 +77,7 @@ pub fn route(path: &str, args: &DcgiArgs, api: Option<&dyn SpotifyApi>, now_ms: 
 fn queue_doc(api: &dyn SpotifyApi, now_ms: i64) -> String {
     match api.queue() {
         Ok(items) => queue_snapshot(&items, now_ms),
-        Err(e) => error("upstream", &e),
+        Err(e) => upstream(&e),
     }
 }
 
@@ -98,7 +98,7 @@ fn queue_add(api: &dyn SpotifyApi, args: &DcgiArgs, now_ms: i64) -> String {
             api.invalidate_now_cache();
             queue_doc(api, now_ms)
         }
-        Err(e) => error("upstream", &e),
+        Err(e) => upstream(&e),
     }
 }
 
@@ -118,7 +118,7 @@ fn search_doc(api: &dyn SpotifyApi, args: &DcgiArgs, now_ms: i64) -> String {
             let tracks = r.tracks.as_ref().map(|p| p.items.as_slice()).unwrap_or(&[]);
             search_snapshot(tracks, now_ms)
         }
-        Err(e) => error("upstream", &e),
+        Err(e) => upstream(&e),
     }
 }
 
@@ -145,7 +145,7 @@ fn playlists_doc(api: &dyn SpotifyApi, args: &DcgiArgs, now_ms: i64) -> String {
         .unwrap_or(0);
     match api.playlists(offset) {
         Ok(p) => playlists_snapshot(&p, now_ms),
-        Err(e) => error("upstream", &e),
+        Err(e) => upstream(&e),
     }
 }
 
@@ -203,7 +203,7 @@ fn map_playlist_err(e: &str) -> String {
             "spotify does not allow this app to read this playlist",
         )
     } else {
-        error("upstream", e)
+        upstream(e)
     }
 }
 
@@ -242,7 +242,7 @@ fn cover(api: &dyn SpotifyApi, rest: &str) -> Vec<u8> {
         Err(e) if e.contains("HTTP 404") || e.contains("no cover") => {
             error("not_found", "album cover not found").into_bytes()
         }
-        Err(e) => error("upstream", &e).into_bytes(),
+        Err(e) => upstream(&e).into_bytes(),
     }
 }
 
@@ -256,7 +256,7 @@ fn volume(api: &dyn SpotifyApi, args: &DcgiArgs, now_ms: i64) -> String {
     match args.raw_arg().trim().parse::<i64>() {
         Ok(v) if (0..=100).contains(&v) => match api.control(Control::Volume(v as u8)) {
             Ok(()) => fresh_now(api, now_ms),
-            Err(e) => error("upstream", &e),
+            Err(e) => upstream(&e),
         },
         _ => error("bad_range", "volume must be an integer 0-100"),
     }
@@ -276,7 +276,7 @@ fn seek(api: &dyn SpotifyApi, args: &DcgiArgs, now_ms: i64) -> String {
     };
     let playing = match api.now_playing() {
         Ok(p) => p,
-        Err(e) => return error("upstream", &e),
+        Err(e) => return upstream(&e),
     };
     let duration = match playing.item.as_ref().map(|t| t.duration_ms) {
         Some(d) if d > 0 => d,
@@ -284,7 +284,7 @@ fn seek(api: &dyn SpotifyApi, args: &DcgiArgs, now_ms: i64) -> String {
     };
     match api.seek(pos.min(duration)) {
         Ok(()) => fresh_now(api, now_ms),
-        Err(e) => error("upstream", &e),
+        Err(e) => upstream(&e),
     }
 }
 
@@ -302,7 +302,7 @@ fn wake(api: &dyn SpotifyApi, args: &DcgiArgs, now_ms: i64) -> String {
         Err(e) if e.contains("no_device") => {
             error("no_device", "gopher-spot device is not registered")
         }
-        Err(e) => error("upstream", &e),
+        Err(e) => upstream(&e),
     }
 }
 
@@ -314,7 +314,7 @@ fn command(api: &dyn SpotifyApi, now_ms: i64, cmd: Control) -> String {
     match api.control(cmd) {
         Ok(()) => fresh_now(api, now_ms),
         Err(_) if already_in_state(api, cmd) => fresh_now(api, now_ms),
-        Err(e) => error("upstream", &e),
+        Err(e) => upstream(&e),
     }
 }
 
@@ -332,17 +332,27 @@ fn already_in_state(api: &dyn SpotifyApi, cmd: Control) -> bool {
     }
 }
 
-/// The `/now` document, served from the ~1s micro-cache (fio S3/2) when warm,
+/// The `/now` document, served from the ~3s micro-cache (fio S3/2) when warm,
 /// else fetched fresh and cached. Queue length is best-effort (never blocks the
 /// snapshot on it), mirroring the human Now Playing. An error is never cached — a
-/// transient upstream failure shouldn't stick for the whole TTL window.
+/// transient upstream failure shouldn't stick for the whole TTL window — but a
+/// rate-limit error (fio 429) degrades to the last good snapshot while one is
+/// within its ~30s stale window, so a polling client keeps rendering through a
+/// Spotify cooldown instead of blanking; past the window it surfaces as
+/// `error rate_limited`.
 fn now_document(api: &dyn SpotifyApi, now_ms: i64) -> String {
     if let Some(cached) = api.cached_now(now_ms) {
         return cached;
     }
     let playing = match api.now_playing() {
         Ok(p) => p,
-        Err(e) => return error("upstream", &e),
+        Err(e) if e.starts_with(crate::spotify::RATE_LIMITED) => {
+            return match api.stale_now(now_ms) {
+                Some(doc) => doc,
+                None => upstream(&e),
+            }
+        }
+        Err(e) => return upstream(&e),
     };
     let queue_len = api.queue().map(|q| q.len()).unwrap_or(0);
     let doc = snapshot(&playing, queue_len, now_ms);
@@ -440,6 +450,19 @@ fn push_item(out: &mut String, i: usize, t: &Track) {
     );
 }
 
+/// The error document for a failed upstream call. Almost always `error
+/// upstream`, but a `rate_limited:`-sentinel error (fio 429: Spotify 429'd us
+/// and the bridge is in its cooldown window) gets its own code so a client can
+/// tell "Spotify is throttling, keep showing what you have" from a real
+/// failure. The message stays fixed — the sentinel text is bridge-internal.
+fn upstream(e: &str) -> String {
+    if e.starts_with(crate::spotify::RATE_LIMITED) {
+        error("rate_limited", "spotify is rate limiting; retry shortly")
+    } else {
+        error("upstream", e)
+    }
+}
+
 /// An error document: `api` / `error <code>` / `message <english>`.
 pub fn error(code: &str, message: &str) -> String {
     let mut out = String::new();
@@ -526,6 +549,10 @@ mod tests {
         // `last_wake` records the play flag the endpoint passed.
         no_device: bool,
         last_wake: RefCell<Option<bool>>,
+        // fio 429: `now_fails` makes now_playing() return this error (e.g. the
+        // rate_limited: sentinel); `stale_doc` is what stale_now() serves.
+        now_fails: Option<ApiError>,
+        stale_doc: Option<String>,
     }
     fn fake(playing: Playing) -> Fake {
         Fake {
@@ -539,6 +566,8 @@ mod tests {
             now_cache: RefCell::new(None),
             no_device: false,
             last_wake: RefCell::new(None),
+            now_fails: None,
+            stale_doc: None,
         }
     }
     fn playing_track() -> Playing {
@@ -566,7 +595,13 @@ mod tests {
     impl SpotifyApi for Fake {
         fn now_playing(&self) -> Result<Playing, ApiError> {
             *self.now_calls.borrow_mut() += 1;
+            if let Some(e) = &self.now_fails {
+                return Err(e.clone());
+            }
             Ok(self.playing.clone())
+        }
+        fn stale_now(&self, _now_ms: i64) -> Option<String> {
+            self.stale_doc.clone()
         }
         fn cached_now(&self, now_ms: i64) -> Option<String> {
             self.now_cache
@@ -1012,6 +1047,52 @@ mod tests {
         call(&f, "/spot/api/1/queue/add?spotify:track:xyz"); // must invalidate
         now_at(&f, TS + 100); // would be a stale hit if not invalidated -> fetch
         assert_eq!(*f.now_calls.borrow(), 2);
+    }
+
+    // ---- fio 429: rate-limit degradation ---------------------------------------
+
+    #[test]
+    fn now_serves_stale_snapshot_while_rate_limited() {
+        let mut f = fake(playing_track());
+        f.now_fails = Some("rate_limited: spotify HTTP 429 (retry after 5s)".into());
+        f.stale_doc = Some("api\t1\r\nstate\tplaying\r\nts\t123\r\n".into());
+        let out = call(&f, "/spot/api/1/now");
+        // The last good snapshot, verbatim (old ts and all) — not an error doc.
+        assert_eq!(out, "api\t1\r\nstate\tplaying\r\nts\t123\r\n");
+    }
+
+    #[test]
+    fn now_rate_limited_without_stale_is_rate_limited_error() {
+        let mut f = fake(playing_track());
+        f.now_fails = Some("rate_limited: spotify cooldown active (until ~999)".into());
+        let out = call(&f, "/spot/api/1/now");
+        assert_wire(&out);
+        assert!(out.contains("error\trate_limited\r\n"), "got: {out}");
+        // The sentinel text is bridge-internal; the message is the fixed one.
+        assert!(!out.contains("rate_limited:"), "sentinel leaked: {out}");
+    }
+
+    #[test]
+    fn now_non_rate_limit_error_is_still_upstream() {
+        let mut f = fake(playing_track());
+        f.now_fails = Some("spotify HTTP 500: boom".into());
+        f.stale_doc = Some("api\t1\r\nstate\tplaying\r\nts\t123\r\n".into());
+        let out = call(&f, "/spot/api/1/now");
+        // A non-429 failure must NOT degrade to the stale snapshot.
+        assert!(out.contains("error\tupstream\r\n"), "got: {out}");
+    }
+
+    #[test]
+    fn upstream_mapper_keys_off_the_sentinel_prefix() {
+        // Every endpoint funnels upstream failures through upstream(): the
+        // sentinel becomes its own error code, anything else stays `upstream`.
+        assert!(upstream("rate_limited: spotify HTTP 429 (retry after 5s)")
+            .contains("error\trate_limited\r\n"));
+        assert!(upstream("spotify HTTP 500: boom").contains("error\tupstream\r\n"));
+        // Only the PREFIX triggers it — a 500 whose body happens to mention
+        // rate limits must not be misclassified.
+        assert!(upstream("spotify HTTP 500: rate_limited: nope")
+            .contains("error\tupstream\r\n"));
     }
 
     // ---- fio S3/3: device + wake ----------------------------------------------

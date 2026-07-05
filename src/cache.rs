@@ -37,10 +37,28 @@ pub fn get(dir: &Path, key: &str, now_unix: i64) -> Option<String> {
 /// a write failure just means a cache miss next time.
 pub fn put(dir: &Path, key: &str, now_unix: i64, ttl_secs: i64, payload: &str) {
     let _ = std::fs::create_dir_all(dir);
-    let _ = std::fs::write(
-        key_file(dir, key),
-        format!("{}\n{}", now_unix + ttl_secs, payload),
+    write_atomic(
+        &key_file(dir, key),
+        format!("{}\n{}", now_unix + ttl_secs, payload).as_bytes(),
     );
+}
+
+/// Write via a same-dir temp file + rename (GS-05): concurrent per-request dcgi
+/// processes write the same entries (e.g. `now_snapshot` on a TTL rollover, the
+/// token at cold start), and a bare `fs::write` lets a reader see a torn,
+/// half-written file. rename(2) is atomic within a filesystem, so a reader gets
+/// either the old or the new entry, never a mix. The pid in the temp name keeps
+/// concurrent writers off each other's temp; a crash can strand one (bounded:
+/// one per pid), swept away with the emptyDir on pod restart. Still best-effort.
+fn write_atomic(file: &Path, bytes: &[u8]) {
+    let tmp = file.with_file_name(format!(
+        "{}.tmp.{}",
+        file.file_name().and_then(|n| n.to_str()).unwrap_or("k"),
+        std::process::id()
+    ));
+    if std::fs::write(&tmp, bytes).is_ok() {
+        let _ = std::fs::rename(&tmp, file);
+    }
 }
 
 /// Byte-safe read: return the cached raw payload for `key` if present and unexpired.
@@ -62,7 +80,7 @@ pub fn put_bytes(dir: &Path, key: &str, now_unix: i64, ttl_secs: i64, payload: &
     let _ = std::fs::create_dir_all(dir);
     let mut buf = format!("{}\n", now_unix + ttl_secs).into_bytes();
     buf.extend_from_slice(payload);
-    let _ = std::fs::write(key_file(dir, key), buf);
+    write_atomic(&key_file(dir, key), &buf);
 }
 
 /// Drop a cached entry now, ignoring whether it existed (best-effort). Used to
@@ -110,6 +128,21 @@ mod tests {
         let body = "line1\nline2\nline3";
         put(&d, "k", 0, 100, body);
         assert_eq!(get(&d, "k", 1), Some(body.into()));
+    }
+
+    #[test]
+    fn atomic_put_leaves_no_tmp_files() {
+        // GS-05: writes go through temp+rename — after a put the dir holds only
+        // final entries, and a reader can never observe a half-written file.
+        let d = tmp("atomic");
+        put(&d, "k", 0, 100, "v");
+        put_bytes(&d, "kb", 0, 100, &[0xFF, 0xD8]);
+        let names: Vec<String> = std::fs::read_dir(&d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names.len(), 2, "exactly the two entries: {names:?}");
+        assert!(names.iter().all(|n| !n.contains(".tmp.")), "{names:?}");
     }
 
     #[test]

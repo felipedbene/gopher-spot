@@ -109,6 +109,12 @@ metadata:
     app: gopher-server
 spec:
   type: LoadBalancer
+  # fio 429 / R2: pin each client IP to one replica. The /now micro-cache (and
+  # its command-time invalidation, and the 429 cooldown) are per-replica files;
+  # round-robin sent a 2s poller alternately to both replicas, so the ~3s cache
+  # was never warm for it and every poll cost real Spotify calls. With affinity
+  # a client's cache, busts, and cooldown all land on the same replica.
+  sessionAffinity: ClientIP
   ports:
     - port: 70
       targetPort: 70

@@ -24,6 +24,11 @@ pub enum Control {
 /// Errors are surfaced to the user as a small gopher menu, so a message is enough.
 pub type ApiError = String;
 
+/// Error sentinel for "Spotify is rate-limiting us" (fio 429) — same idiom as
+/// `no_device:`: `ApiError` stays a plain String and the API layer keys off this
+/// prefix to emit `error rate_limited` (and serve the stale `/now` snapshot).
+pub const RATE_LIMITED: &str = "rate_limited:";
+
 // ---- Response models (serde; always compiled so render/tests work offline) ----
 
 #[derive(Debug, Clone, Deserialize)]
@@ -280,6 +285,13 @@ pub trait SpotifyApi {
     /// Drop any cached `/now` so the next poll re-fetches. Commands call this so a
     /// state change is never masked by a stale cached snapshot.
     fn invalidate_now_cache(&self) {}
+    /// The last good `/now` doc within the stale-serve window (~30s) — the 429
+    /// fallback (fio 429): while Spotify is rate-limiting us, a poll gets the most
+    /// recent snapshot instead of an error, so the client keeps rendering. The
+    /// old `ts` makes it inert to a client's newest-wins snapshot guard.
+    fn stale_now(&self, _now_ms: i64) -> Option<String> {
+        None
+    }
 }
 
 // ---- The real blocking client (net feature) --------------------------------
@@ -306,12 +318,30 @@ mod net {
     const PLAYLISTS_TTL: i64 = 60; // 60 s
     const CATALOG_TTL: i64 = 86_400; // 24h — albums/artists are effectively static
     const HTTP_TIMEOUT_SECS: u64 = 10;
-    // /now micro-cache window (fio S3/2). Kept in MILLISECONDS: the `now_snapshot`
-    // entry is written and read with the request wall-clock in ms (not the seconds
-    // clock the other keys use), so the cache module's opaque expiry comparison
-    // gives us a true ~1s window. Short enough that the client's ts-interpolation
-    // fully absorbs the staleness; long enough to fold a poll burst into one call.
-    const NOW_CACHE_TTL_MS: i64 = 1_000;
+    // Upcoming-queue cache (fio 429 / R1): `queue()` used to hit Spotify on every
+    // call — and `/now` calls it for `queue_len` on every miss, doubling the
+    // player-endpoint rate. 10s is fresh enough for a queue display; commands and
+    // queue_add bust it via `invalidate_now_cache`.
+    const QUEUE_TTL: i64 = 10;
+    // /now micro-cache window (fio S3/2, widened by fio 429 / R2). Kept in
+    // MILLISECONDS: the `now_snapshot` entry is written and read with the request
+    // wall-clock in ms (not the seconds clock the other keys use), so the cache
+    // module's opaque expiry comparison gives us a true ~3s window. 1s could never
+    // serve a single 2s poller (each poll landed past the TTL — with round-robin
+    // replicas, doubly so); 3s folds a steady 2s poll into ~one upstream fetch per
+    // window. The client interpolates from `ts`, absorbing the staleness, and
+    // commands invalidate, so a state change is never masked.
+    const NOW_CACHE_TTL_MS: i64 = 3_000;
+    // Stale-serve window for the 429 fallback (fio 429 / R3): `store_now` keeps a
+    // second copy of the doc this long, and `/now` serves it (in place of an
+    // error) while a Spotify cooldown is active. Bounded so a long outage
+    // eventually surfaces as an error instead of a frozen half-minute-old track.
+    const STALE_NOW_TTL_MS: i64 = 30_000;
+    // Spotify-cooldown clamp (fio 429 / R3): a 429's Retry-After drives the
+    // cooldown entry; missing/unparseable (e.g. the HTTP-date form) falls back to
+    // the default, and the cap keeps a hostile/huge value from parking the bridge.
+    const COOLDOWN_DEFAULT_SECS: i64 = 5;
+    const COOLDOWN_MAX_SECS: i64 = 60;
 
     #[derive(Deserialize)]
     struct RawPlaylists {
@@ -418,8 +448,22 @@ mod net {
         }
 
         /// A valid bearer token: the disk-cached one until it nears expiry, else a
-        /// fresh refresh (cached with `expires_in - 60s` slack).
+        /// fresh refresh (cached with `expires_in - 60s` slack). Refreshes are
+        /// single-flighted per replica (GS-07): concurrent per-request processes
+        /// that all miss the cache serialize on a lockfile and re-check after
+        /// acquiring, so only the first actually POSTs the (rate-limited) token
+        /// endpoint — the rest read its freshly-cached token.
         fn access_token(&self) -> Result<String, ApiError> {
+            if let Some(t) = cache::get(&self.state_dir, "access_token", self.now_unix) {
+                return Ok(t);
+            }
+            if let Some(e) = self.cooldown_active() {
+                return Err(e);
+            }
+            let _lock = flock_exclusive(&self.state_dir);
+            // Re-check under the lock: another process may have refreshed while
+            // we waited. Best-effort — if the lock couldn't be taken, this is
+            // just the old (pre-GS-07) unserialized behavior.
             if let Some(t) = cache::get(&self.state_dir, "access_token", self.now_unix) {
                 return Ok(t);
             }
@@ -432,7 +476,12 @@ mod net {
                     ("client_id", &self.client_id),
                     ("client_secret", &self.client_secret),
                 ])
-                .map_err(|e| format!("token refresh failed: {e}"))?;
+                .map_err(|e| match self.map_api_err(e) {
+                    // Keep the sentinel bare so the API layer's prefix check sees
+                    // it; a token-endpoint 429 also arms the cooldown (GS-07).
+                    s if s.starts_with(RATE_LIMITED) => s,
+                    s => format!("token refresh failed: {s}"),
+                })?;
             let tok: TokenResp = resp
                 .into_json()
                 .map_err(|e| format!("token parse failed: {e}"))?;
@@ -447,18 +496,53 @@ mod net {
             Ok(tok.access_token)
         }
 
+        /// The rate-limit circuit breaker (fio 429 / R3): `Some(err)` while a
+        /// `spotify_cooldown` entry is live — callers must NOT hit Spotify, so the
+        /// rolling window drains instead of being re-tripped by every poll. The
+        /// entry's own expiry IS the window (written from Retry-After on a 429).
+        fn cooldown_active(&self) -> Option<ApiError> {
+            cache::get(&self.state_dir, "spotify_cooldown", self.now_unix)
+                .map(|until| format!("{RATE_LIMITED} spotify cooldown active (until ~{until})"))
+        }
+
+        /// Like the free [`api_err`], but a 429 additionally arms the cooldown
+        /// entry from `Retry-After` and comes back with the `rate_limited:`
+        /// sentinel. Must be used for every api/accounts.spotify.com call (the
+        /// public-CDN `download` keeps plain `api_err`: its 429s are not the Web
+        /// API's window).
+        fn map_api_err(&self, e: ureq::Error) -> ApiError {
+            if let ureq::Error::Status(429, ref resp) = e {
+                let secs = retry_after_secs(resp.header("Retry-After"));
+                cache::put(
+                    &self.state_dir,
+                    "spotify_cooldown",
+                    self.now_unix,
+                    secs,
+                    &(self.now_unix + secs).to_string(),
+                );
+                return format!("{RATE_LIMITED} spotify HTTP 429 (retry after {secs}s)");
+            }
+            api_err(e)
+        }
+
         fn get(&self, path: &str) -> Result<ureq::Response, ApiError> {
+            if let Some(e) = self.cooldown_active() {
+                return Err(e);
+            }
             let token = self.access_token()?;
             self.agent
                 .get(&format!("{API}{path}"))
                 .set("Authorization", &format!("Bearer {token}"))
                 .call()
-                .map_err(api_err)
+                .map_err(|e| self.map_api_err(e))
         }
 
         /// A body-less state change (play/pause/next/prev/volume). Spotify returns
         /// 202/204 with no body on success.
         fn command(&self, method: &str, path: &str) -> Result<(), ApiError> {
+            if let Some(e) = self.cooldown_active() {
+                return Err(e);
+            }
             let token = self.access_token()?;
             let req = self
                 .agent
@@ -475,7 +559,7 @@ mod net {
             } else {
                 req.send_string("")
             };
-            res.map(|_| ()).map_err(api_err)
+            res.map(|_| ()).map_err(|e| self.map_api_err(e))
         }
 
         /// Download raw bytes from a full URL (a Spotify CDN image — public, so no
@@ -564,8 +648,24 @@ mod net {
         }
 
         fn queue(&self) -> Result<Vec<Track>, ApiError> {
-            let resp = self.get("/v1/me/player/queue")?;
-            if resp.status() == 204 {
+            // Cached (fio 429 / R1): `/now` calls this for `queue_len` on every
+            // micro-cache miss, so uncached it doubled the player-endpoint rate.
+            // Not via `get_cached`: a 204 (empty queue) has no body, so emptiness
+            // is cached as "" and mapped back to an empty vec on read. Commands
+            // and queue_add bust the entry through `invalidate_now_cache`.
+            let body = if let Some(c) = cache::get(&self.state_dir, "queue", self.now_unix) {
+                c
+            } else {
+                let resp = self.get("/v1/me/player/queue")?;
+                let s = if resp.status() == 204 {
+                    String::new()
+                } else {
+                    resp.into_string().map_err(|e| e.to_string())?
+                };
+                cache::put(&self.state_dir, "queue", self.now_unix, QUEUE_TTL, &s);
+                s
+            };
+            if body.is_empty() {
                 return Ok(Vec::new());
             }
             #[derive(Deserialize)]
@@ -573,8 +673,7 @@ mod net {
                 #[serde(default = "Vec::new")]
                 queue: Vec<Track>,
             }
-            let q: RawQueue = resp
-                .into_json()
+            let q: RawQueue = serde_json::from_str(&body)
                 .map_err(|e| format!("queue parse failed: {e}"))?;
             Ok(q.queue)
         }
@@ -847,14 +946,64 @@ mod net {
                 NOW_CACHE_TTL_MS,
                 doc,
             );
+            // Second, longer-lived copy for the 429 fallback (fio 429 / R3):
+            // while a cooldown is active `/now` serves this instead of an error.
+            cache::put(
+                &self.state_dir,
+                "now_snapshot_stale",
+                now_ms,
+                STALE_NOW_TTL_MS,
+                doc,
+            );
         }
         fn invalidate_now_cache(&self) {
             cache::remove(&self.state_dir, "now_snapshot");
+            // The queue cache rides the same bust: every command that can change
+            // playback state can also change the upcoming queue. The stale copy
+            // is deliberately KEPT — it's the 429 fallback, and its old `ts`
+            // makes it inert to a client's newest-wins guard.
+            cache::remove(&self.state_dir, "queue");
+        }
+        fn stale_now(&self, now_ms: i64) -> Option<String> {
+            cache::get(&self.state_dir, "now_snapshot_stale", now_ms)
         }
     }
 
     fn non_empty(var: &str) -> Option<String> {
         std::env::var(var).ok().filter(|v| !v.is_empty())
+    }
+
+    /// The cooldown length a 429's `Retry-After` asks for: its integer-seconds
+    /// form clamped to `1..=COOLDOWN_MAX_SECS`; anything else (absent, or the
+    /// HTTP-date form we don't bother parsing) falls back to the default.
+    fn retry_after_secs(header: Option<&str>) -> i64 {
+        header
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .map(|s| s.clamp(1, COOLDOWN_MAX_SECS))
+            .unwrap_or(COOLDOWN_DEFAULT_SECS)
+    }
+
+    /// Take an exclusive `flock` on `<dir>/access_token.lock`, blocking until
+    /// acquired (GS-07 single-flight). The lock lives exactly as long as the
+    /// returned handle: the fd's close on drop releases it, so there is no stale-
+    /// lock cleanup. Best-effort — `None` (couldn't create/lock) means the caller
+    /// proceeds unserialized, which is just the pre-GS-07 behavior.
+    fn flock_exclusive(dir: &std::path::Path) -> Option<std::fs::File> {
+        use std::os::unix::io::AsRawFd;
+        let _ = std::fs::create_dir_all(dir);
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join("access_token.lock"))
+            .ok()?;
+        // LOCK_EX blocks; a refresh is one HTTP round-trip (≤ the 10s agent
+        // timeout), so waiters are parked briefly, not indefinitely.
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            Some(f)
+        } else {
+            None
+        }
     }
 
     /// Map a ureq error to a user message, unwrapping HTTP status responses (a
@@ -942,6 +1091,62 @@ mod net {
             let first = vec![dev("Echo", Some("cc"), false)];
             assert_eq!(pick_device(&first).unwrap(), "cc");
             assert!(pick_device(&[]).is_err());
+        }
+
+        // ---- fio 429: cooldown circuit breaker ----------------------------
+
+        #[test]
+        fn retry_after_parse_clamps_and_defaults() {
+            assert_eq!(retry_after_secs(Some("7")), 7);
+            assert_eq!(retry_after_secs(Some(" 30 ")), 30);
+            assert_eq!(retry_after_secs(Some("0")), 1); // floor: never a 0s window
+            assert_eq!(retry_after_secs(Some("100000")), COOLDOWN_MAX_SECS);
+            // The HTTP-date form (unparsed) and absence both fall back.
+            assert_eq!(
+                retry_after_secs(Some("Wed, 21 Oct 2026 07:28:00 GMT")),
+                COOLDOWN_DEFAULT_SECS
+            );
+            assert_eq!(retry_after_secs(None), COOLDOWN_DEFAULT_SECS);
+        }
+
+        fn client_at(dir: &std::path::Path, now_unix: i64) -> Client {
+            Client {
+                client_id: "id".into(),
+                client_secret: "secret".into(),
+                refresh_token: "rt".into(),
+                state_dir: dir.to_path_buf(),
+                now_unix,
+                agent: ureq::AgentBuilder::new().build(),
+            }
+        }
+
+        #[test]
+        fn cooldown_blocks_calls_and_expires() {
+            let dir = std::env::temp_dir().join("gopher-spot-test-cooldown");
+            let _ = std::fs::remove_dir_all(&dir);
+            let c = client_at(&dir, 1_000);
+            assert!(c.cooldown_active().is_none(), "no cooldown armed yet");
+            cache::put(&dir, "spotify_cooldown", 1_000, 5, "1005");
+            assert!(c
+                .cooldown_active()
+                .expect("cooldown armed")
+                .starts_with(RATE_LIMITED));
+            // get() must short-circuit on the cooldown BEFORE any network I/O:
+            // the sentinel error proves the request never left the process.
+            let e = c.get("/v1/never/called").unwrap_err();
+            assert!(e.starts_with(RATE_LIMITED), "got: {e}");
+            // Past the window the breaker closes again.
+            assert!(client_at(&dir, 1_005).cooldown_active().is_none());
+        }
+
+        #[test]
+        fn flock_is_reacquirable_after_drop() {
+            let dir = std::env::temp_dir().join("gopher-spot-test-flock");
+            let _ = std::fs::remove_dir_all(&dir);
+            let l1 = flock_exclusive(&dir);
+            assert!(l1.is_some(), "lock acquired");
+            drop(l1); // fd close releases
+            assert!(flock_exclusive(&dir).is_some(), "reacquirable after drop");
         }
     }
 }

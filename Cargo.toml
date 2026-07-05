@@ -21,7 +21,7 @@ path = "src/main.rs"
 # `cargo test --no-default-features` builds the pure offline core.
 [features]
 default = ["net"]
-net = ["dep:ureq"]
+net = ["dep:ureq", "dep:libc"]
 
 [dependencies]
 # The shared gopher spine (menu model + .gph serializer). std-only, pinned by tag
@@ -34,6 +34,9 @@ serde_json = "1"
 # (ring builds on both amd64 and arm64 — both little-endian, so no big-endian
 # caveat here). A per-request dcgi wants a blocking client with no async runtime.
 ureq = { version = "2", optional = true, default-features = false, features = ["tls", "json"] }
+# flock(2) for the token-refresh single-flight (GS-07): per-request dcgi
+# processes can only coordinate through the filesystem. net-gated like ureq.
+libc = { version = "0.2", optional = true }
 
 [profile.release]
 opt-level = 3
