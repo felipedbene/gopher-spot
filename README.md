@@ -22,6 +22,7 @@ design brief and [the build story](#build-story) for what it cost.
 - [Code map (UML)](#code-map-uml)
 - [dcgi routing](#dcgi-routing)
 - [The machine API (for the DeToca client)](#the-machine-api-for-the-detoca-client)
+- [Upstream protection (Spotify rate limits)](#upstream-protection-spotify-rate-limits)
 - [Audio delivery: the Icecast fallback](#audio-delivery-the-icecast-fallback)
 - [Design decisions](#design-decisions)
 - [Hard-won gotchas](#hard-won-gotchas)
@@ -179,7 +180,8 @@ classDiagram
         <<module — machine API /spot/api/1>>
         now/play/pause/next/prev/volume/seek
         queue, queue/add, cover(JPEG), wake, search
-        playlists, playlists/[id]; approx ~1s /now micro-cache
+        playlists, playlists/[id]
+        ~3s /now micro-cache + 429 stale fallback
     }
 
     class SpotifyApi {
@@ -192,7 +194,9 @@ classDiagram
         +control(cmd) ; +seek(pos)
         +playlists(offset) ; +playlist_tracks(id, off) ; +playlist_name(id)
         +album/album_tracks/artist/artist_albums/artist_top_tracks
-        +cached_now/store_now/invalidate_now_cache
+        +cached_now/store_now/stale_now
+        +invalidate_now_cache/invalidate_queue_cache
+        +now_fetch_lock : single-flight misses
     }
     class Client {
         <<net feature — blocking ureq>>
@@ -222,8 +226,9 @@ classDiagram
         <<module — file TTL cache>>
         +get/put(dir, key, now, ttl) String
         +get_bytes/put_bytes (cover JPEGs)
-        +remove(dir, key) : bust /now micro-cache
+        +remove(dir, key) : cache busts
         FNV-1a keyed files: expiry\npayload
+        atomic writes; expired entries reaped on read
     }
     class latin1 {
         <<module — default encoder>>
@@ -271,14 +276,15 @@ classDiagram
 | `dcgi.rs`       | Parse geomyidae's 6 args; route a **human** selector to a gophermap. Pure, fake-testable. |
 | `api.rs`        | The **machine API** (`/spot/api/1/*`): tab-delimited UTF-8 (or raw cover JPEG) served verbatim by a `.cgi`. Frozen v1 contract — see [`API.md`](API.md). |
 | `spotify.rs`    | `SpotifyApi` trait + response models + the real blocking `ureq` `Client`.        |
-| `cache.rs`      | File-backed TTL cache (token; search 5 min; devices 30 s; playlists 60 s; albums/artists 24 h; cover JPEGs 24 h; `/now` micro-cache ~1 s). Byte-safe + `remove`. |
+| `cache.rs`      | File-backed TTL cache (token; search 5 min; devices 30 s; playlists 60 s; queue 10 s; albums/artists/covers 24 h; `/now` micro-cache ~3 s + 30 s stale copy; 429 cooldown = `Retry-After`; catalog 404s negative-cached 5 min). Atomic temp+rename writes; expired entries reaped on read. |
 | `latin1.rs`     | **UTF-8 → Latin-1** transcode (the default) so Netscape Communicator renders accents right. |
 | `macroman.rs`   | UTF-8 → Mac OS Roman transcode — the `GOPHER_ENCODING=macroman` fallback (TurboGopher). |
 | `menu.rs`       | The static root menu, the RFC-1436 66-column clip, the type-`s` `.pls` line.     |
 
-**82 unit tests**, all offline (`cargo test --no-default-features` builds the pure
-core — 79 tests; `cargo test` adds the URL-encoding + device-pick tests). Rendering
-(human menus and the machine API) is tested against a fake `SpotifyApi`, no network.
+**97 unit tests**, all offline (`cargo test --no-default-features` builds the pure
+core — 88 tests; `cargo test` adds the URL-encoding, device-pick, circuit-breaker,
+and cache-bust tests, still without a network). Rendering (human menus and the
+machine API) is tested against a fake `SpotifyApi`.
 
 ---
 
@@ -345,7 +351,7 @@ machine-parseable surface instead of scraping localized menu text. That's the
 
 | Endpoint | Purpose |
 |----------|---------|
-| `now` | playback snapshot: `state`, track/artist/album, `album_id`, `position_ms`/`duration_ms`, `volume`, `queue_len`, **`device active\|idle`**, `ts`. Cached **~1 s** (a poll burst = one upstream call; commands bust it). |
+| `now` | playback snapshot: `state`, track/artist/album, `album_id`, `position_ms`/`duration_ms`, `volume`, `queue_len`, **`device active\|idle`**, `ts`. Cached **~3 s** (a poll burst = one upstream fetch; commands bust it); during a Spotify 429 cooldown it serves the last good snapshot (≤30 s, original `ts`) before surfacing `error rate_limited`. |
 | `play` `pause` `next` `prev` `volume?N` `seek?N` | transport; each replies with a fresh `now` snapshot. |
 | `queue` · `queue/add?<uri>` | upcoming tracks; enqueue a track. No `queue/clear` (the Web API has none). |
 | `cover/<album_id>/<size>` | **raw JPEG** (type-`I`), sizes 64/300/640, disk-cached 24 h. The one binary endpoint. |
@@ -355,7 +361,12 @@ machine-parseable surface instead of scraping localized menu text. That's the
 
 Errors are `key<TAB>value` too: `api` / `error <code>` / `message`. Codes:
 `bad_range`, `bad_uri`, `bad_query`, `no_track`, `no_device`, `not_found`,
-`forbidden`, `upstream`.
+`forbidden`, `rate_limited` (Spotify is throttling the bridge — keep the last
+snapshot, retry shortly), `upstream`.
+
+Writing or auditing a client? **[`CLIENTS.md`](CLIENTS.md)** is the best-practices
+guide (poll cadence, `ts` interpolation, `rate_limited` handling, cover caching)
+with a spot-check checklist.
 
 The DeToca client now consumes this **whole** surface (its *fio 10*): a
 cover-forward player, the "up next" queue with thumbnails, track search, the
@@ -366,6 +377,30 @@ playlists list with context play, and `device`/`wake` recovery — see
 > the client socket, so any `eprintln!`/panic on an API request path prepends bytes
 > to the response — invisible on text, but it *corrupts the cover JPEG*. Rule:
 > **never write to stderr on the `/spot/api/*` path.**
+
+## Upstream protection (Spotify rate limits)
+
+Spotify's **player** endpoints (`/v1/me/player*`) rate-limit on a rolling window
+at surprisingly low volume: a single client polling `/now` every 2 s through two
+round-robin replicas was enough to trip sustained 429s (each miss cost two player
+calls, the per-replica cache was never warm for one poller, and nothing honored
+`Retry-After` — so the window never drained). The bridge now layers defenses
+between every client and Spotify:
+
+| Layer | What it does |
+|-------|--------------|
+| `/now` micro-cache (~3 s) | A poll burst = one upstream fetch; every poll in the window gets the **same document, same `ts`** (clients interpolate). Commands bust it so state changes are never masked. |
+| Single-flight | Concurrent cache misses in one replica serialize on a lockfile — for the `/now` fetch *and* the token refresh — so a burst costs one upstream call, not one per dcgi process. |
+| Circuit breaker | Any Web-API 429 arms a cooldown from `Retry-After` (default 5 s, capped 60 s). While armed, **no request leaves the bridge**: every call path short-circuits, letting Spotify's window actually drain. |
+| Stale-serve | During a cooldown, `/now` returns the last good snapshot (≤30 s old, original `ts`) instead of an error, so a polling client keeps rendering; past that it's `error rate_limited`. |
+| Call minimization | The queue is cached 10 s and busted only by queue-changing commands (next/prev/queue-add); `/now` skips the queue call entirely when stopped; catalog 404s are negative-cached 5 min; the play/pause idempotency probe fires only on a real 403. |
+| Session affinity | `sessionAffinity: ClientIP` on the Service pins each client to one replica, so the per-replica caches are actually warm for a steady poller. |
+
+Measured effect when this landed: **~60 player calls/min → ~17** for a 2 s
+poller, zero 429s over 150 polls. What the *clients* must do to keep it that way
+is in [`CLIENTS.md`](CLIENTS.md).
+
+---
 
 ## Audio delivery: the Icecast fallback
 
@@ -468,6 +503,7 @@ them earned:
 | 11 | geomyidae's **`handlecgi` splices the child's stderr** into the client socket → any `eprintln!` on the `/spot/api/*` path corrupts the response (silently for text; a garbled cover JPEG for binary). | **Never write to stderr on the API path.** |
 | 12 | Spotify **403s playlist track reads for every playlist — including the user's own** (Nov-2024 dev-mode block, *not* a scope gap: the token has `playlist-read-private`). | Map 403→`forbidden`; list names/ids only; play playlists as a **context** (needs no track-read). |
 | 13 | `%XX` query decode as Latin-1 **mangles UTF-8** (`search?q=construção`). | Decode into bytes, then `from_utf8_lossy` (`DcgiArgs::query`). |
+| 14 | Spotify **player endpoints 429 at low volume** (one 2 s `/now` poller tripped it) and calling during the window prolongs it. | The layered defense in [Upstream protection](#upstream-protection-spotify-rate-limits): micro-cache + single-flight + `Retry-After` circuit breaker + stale-serve + session affinity. |
 
 ---
 
@@ -550,12 +586,13 @@ The lopsided ratio — features in an evening, one audio bug across a morning �
 the real lesson: gluing modern SaaS to vintage clients, the protocol translation
 is easy; the **stateful media plane** is where the time goes.
 
-**Since then** (2026-07-02/03) the project roughly doubled: a navigable music
+**Since then** (2026-07-02/05) the project roughly doubled: a navigable music
 graph (album/artist/discography pages), the switch to **Latin-1** for Netscape,
-inline transport controls, audio robustness (FIFO respawn + internal drainer), and
+inline transport controls, audio robustness (FIFO respawn + internal drainer),
 the whole **`/spot/api/1` machine API** for the DeToca client (`now`/transport,
-`queue`, `cover`, `search`, `device`+`wake`, `playlists`, context play, the ~1 s
-micro-cache). Current totals: **~30 commits, ~4,100 lines of Rust, 82 tests.**
+`queue`, `cover`, `search`, `device`+`wake`, `playlists`, context play), and the
+**rate-limit hardening** ([Upstream protection](#upstream-protection-spotify-rate-limits)).
+Current totals: **~38 commits, ~4,600 lines of Rust, 97 tests.**
 
 ---
 
@@ -565,6 +602,7 @@ micro-cache). Current totals: **~30 commits, ~4,100 lines of Rust, 82 tests.**
 gopher-spot/
 ├── README.md                         # this file
 ├── API.md                            # frozen /spot/api/1 machine-API contract
+├── CLIENTS.md                        # client best-practices guide + spot-check checklist
 ├── PROMPT.md                         # original design brief (pt-BR)
 ├── Cargo.toml                        # net feature gates ureq; serde always on
 ├── src/

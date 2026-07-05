@@ -300,9 +300,10 @@ returns the smallest image ≥ the requested size, falling back to the largest
 available.
 
 Covers are **immutable** per `album_id`+size, so the server caches the JPEG bytes
-on disk (24 h). Only a cache **miss** hits Spotify's CDN (logged as `[cover] miss …`
-on stderr); the Radinho asking for a cover on every track change, and the playlist
-asking for N thumbnails at once, are served from cache.
+on disk (24 h). Only a cache **miss** hits Spotify's CDN (nothing is logged on the
+API path — geomyidae splices stderr into the socket); the Radinho asking for a
+cover on every track change, and the playlist asking for N thumbnails at once,
+are served from cache.
 
 Errors are returned in the normal v1 **text** error format (so a client that gets
 a text body instead of JPEG reads the code):
@@ -321,10 +322,15 @@ message	<english description>
 Codes: `bad_range`, `bad_uri`, `bad_query` (fio S3/4: empty search `q`),
 `no_track`, `no_device` (fio S3/3: `wake` found no registered gopher-spot
 device), `not_found`, `forbidden` (fio S3/5: Spotify blocks this app from reading
-the playlist — distinct from `not_found`; the playlist exists), `upstream` (a
-Spotify/transport failure, or the OAuth Secret not being configured). `message`
-is human-readable English and **not** part of the stable contract — switch on
-`error`, not on text.
+the playlist — distinct from `not_found`; the playlist exists), `rate_limited`
+(fio 429: Spotify is throttling the bridge, which is inside its cooldown window —
+keep showing the last snapshot and retry at your normal cadence; do **not** poll
+faster), `upstream` (a Spotify/transport failure, or the OAuth Secret not being
+configured). `message` is human-readable English and **not** part of the stable
+contract — switch on `error`, not on text.
+
+Client-side rules for all of this — cadence, backoff, caching — live in
+[`CLIENTS.md`](CLIENTS.md).
 
 ## Versioning
 
@@ -338,15 +344,27 @@ is human-readable English and **not** part of the stable contract — switch on
 
 ## Known deviations
 
-- **`/now` micro-cache (added in fio S3/2).** The server caches the rendered
-  `/now` document for **~1 second**. A burst of polls inside that window collapses
-  to a **single** upstream Spotify call, and every poll in the window returns the
-  **same document — including the same `ts`**. This is deliberate: interpolate the
-  progress with `ts` (`estimated_position = position_ms + (now − ts)`) and a
-  ≤1 s-stale snapshot is invisible. **Commands bust the cache**: after any
-  `play`/`pause`/`next`/`prev`/`volume`/`seek`/`queue/add`/`wake`, the next `/now`
-  is fetched fresh, so a state change is never masked by the cache. The TTL is a
-  fixed constant (no configuration); errors are never cached.
+- **`/now` micro-cache (fio S3/2, widened in fio 429).** The server caches the
+  rendered `/now` document for **~3 seconds**. A burst of polls inside that window
+  collapses to a **single** upstream Spotify fetch, and every poll in the window
+  returns the **same document — including the same `ts`**. This is deliberate:
+  interpolate the progress with `ts` (`estimated_position = position_ms +
+  (now − ts)`) and a ≤3 s-stale snapshot is invisible. **Commands bust the
+  cache**: after any `play`/`pause`/`next`/`prev`/`volume`/`seek`/`queue/add`/
+  `wake`, the next `/now` is fetched fresh, so a state change is never masked by
+  the cache. The TTL is a fixed constant (no configuration); errors are never
+  cached.
+- **Rate-limit degradation (fio 429).** When Spotify 429s the bridge, it stops
+  calling Spotify for the `Retry-After` window. During that window `/now` serves
+  the **last good snapshot** (up to ~30 s old, with its **original `ts`**) so a
+  polling client keeps rendering; other endpoints (and `/now` past the stale
+  window) return `error rate_limited`. A snapshot with an old `ts` is
+  indistinguishable from a normal cache hit — interpolate as usual.
+- **`not_found` is negative-cached (~5 min).** An unknown album/playlist id keeps
+  answering `not_found` from cache without an upstream call, so a brand-new
+  resource can take up to ~5 minutes to appear. Don't retry-loop a `not_found`.
+- **`queue_len` is best-effort.** The queue is cached ~10 s server-side, and when
+  nothing is playing `/now` reports `queue_len` `0` without consulting Spotify.
 - **Eventual consistency after a command.** The snapshot a command returns
   reflects what Spotify's Web API reports *at that instant*. Spotify is eventually
   consistent for the librespot Connect device: a `seek` (and sometimes the device

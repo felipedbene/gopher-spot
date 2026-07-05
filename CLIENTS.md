@@ -1,0 +1,115 @@
+# Client best practices — `/spot/api/1`
+
+How a well-behaved client uses the bridge. The server defends Spotify's rate
+limits on its own ([README → Upstream protection](README.md#upstream-protection-spotify-rate-limits)),
+but a sloppy client can still waste round-trips, fight the caches, or turn a
+throttling blip into a frozen UI. Use the [checklist](#spot-check-checklist) to
+audit a client (Casquinha / DeToca / anything new).
+
+The wire contract itself (endpoints, keys, error codes) is [`API.md`](API.md);
+this document is only about *how to consume it well*.
+
+## Polling `/now`
+
+1. **Poll at a fixed cadence, ≥2 s. Never faster.** The server's micro-cache
+   window is ~3 s, so a 2 s poll costs roughly one upstream fetch per window.
+   Sub-second polling buys nothing — you'll receive the same document again.
+2. **Interpolate with `ts`, don't poll harder.** Progress display should be
+   `position_ms + (local_now − ts)` while `state` is `playing`. Two polls in one
+   cache window return byte-identical documents (same `ts`) — that's a cache
+   hit, not a bug.
+3. **Guard with newest-wins.** Keep the `ts` of the snapshot you're rendering
+   and ignore any incoming snapshot with an older `ts`. This makes the
+   rate-limit stale-serve (below) and out-of-order responses harmless.
+4. **Don't fire a `/now` poll right after a command.** Every command already
+   replies with a fresh snapshot — render *that*. An extra poll is a wasted
+   round-trip (and on a miss, a wasted upstream call).
+
+## Errors and backoff
+
+5. **Switch on the `error` code, never on `message` text.** `message` is
+   explicitly not part of the frozen contract.
+6. **`rate_limited` = keep calm and keep the last snapshot.** Spotify is
+   throttling the bridge; the bridge is already refusing to call upstream. The
+   right client behavior: keep rendering what you have, keep your normal poll
+   cadence (the bridge answers from cache — polls are cheap), and *don't* add a
+   retry storm. Note `/now` usually shields you: for up to ~30 s of throttling
+   you receive stale-but-valid snapshots, not this error.
+7. **Never tight-loop a failed command.** One retry after a short pause (2–5 s)
+   is fine; automated rapid retries of `play`/`next`/`wake` are how a cooldown
+   window gets extended. Surface the error to the human instead.
+8. **Don't retry-loop `not_found`.** It's negative-cached ~5 min server-side, so
+   your retries are answered from cache and can't "refresh" anything.
+
+## Covers
+
+9. **Covers are immutable — cache them client-side, keyed `album_id:size`,
+   forever** (or LRU-bounded by disk, never by time). The server caches them
+   24 h, but your cache hit costs zero round-trips.
+10. **Fetch a cover only when `album_id` changes**, not per `/now` poll. The
+    `album_id` key on the snapshot is your cache key; no `album_id`, no fetch.
+11. **Request only the canonical sizes** — `64`, `300`, `640`. Anything else is
+    a `bad_range` error, guaranteed.
+12. **Expect text on failure.** If the first bytes aren't JPEG (`FF D8`), parse
+    the body as a v1 error document instead of rendering garbage.
+
+## Queue, search, playlists
+
+13. **`queue/add` is eventually consistent.** The returned `/queue` snapshot may
+    not contain the item yet (~1–2 s). Re-poll `/queue` once after a short
+    delay; don't loop until it appears.
+14. **`queue_len` is best-effort** — a display hint, not truth. It can be up to
+    ~10 s stale and is `0` whenever nothing is playing. Never gate logic on it;
+    fetch `/queue` when the user actually opens the queue view.
+15. **Debounce search.** Send `search?q=` on submit (or ≥500 ms idle), never per
+    keystroke. Results cap at 10 — that's a Spotify limit, not a paging hint.
+16. **URL-encode the query as UTF-8 bytes** (`construção` →
+    `constru%C3%A7%C3%A3o`). Latin-1/MacRoman percent-encoding mangles accents.
+17. **Playlists: expect `forbidden` on track reads** (Spotify's dev-mode block —
+    even the user's own playlists). List names/ids, and play a playlist as a
+    context via the human `/spot/play?context_uri=` endpoint; don't treat
+    `forbidden` as a client bug or retry it.
+
+## Commands and device state
+
+18. **`wake` is a user action, not a reflex.** Offer it when `device` is `idle`;
+    never auto-`wake` in a poll loop (a phone user would fight the bridge for
+    the playback session).
+19. **Trust the server's clamps.** `seek` clamps to the track duration and
+    `volume` rejects out-of-range values server-side; client-side pre-validation
+    is only a UX nicety.
+20. **Expect eventual consistency after `seek`/`volume`.** The reply snapshot
+    can still show the pre-command value; it settles within ~1–2 s of polling.
+    Don't re-issue the command because the echo looks stale.
+21. **Parse forward-compatibly.** `key<TAB>value`, CRLF lines, UTF-8. Ignore
+    unknown keys (v1 grows additively) and tolerate keys appearing in any order.
+    Metadata keys (`track`…`duration_ms`) exist only when a track is loaded —
+    key off `state` first.
+
+## Spot-check checklist
+
+Watch one client session (server logs + a packet trace or client debug log) and
+tick these off:
+
+| # | Check | Pass looks like |
+|---|-------|-----------------|
+| 1 | `/now` cadence | fixed, ≥2 s apart; no bursts; no sub-second gaps ever |
+| 2 | Cache-window polls | client renders identical-`ts` snapshots without re-drawing or complaining |
+| 3 | Progress bar | advances smoothly *between* polls (interpolating), doesn't jump at each poll |
+| 4 | After a command | no `/now` request within ~1 s of the command (the reply snapshot was used) |
+| 5 | During throttling | UI keeps showing the last track through a 429 window; poll rate unchanged; no command retry storm |
+| 6 | Covers | at most one `cover` request per distinct `album_id`+size per app run; none during steady `/now` polling |
+| 7 | Cover sizes | only 64/300/640 ever requested |
+| 8 | Search | one request per submitted query, not per keystroke; accents arrive intact |
+| 9 | `queue/add` | one add + at most one follow-up `/queue` poll |
+| 10 | `wake` | only after user intent, never automatic |
+| 11 | Unknown keys | feeding the client an extra `x_test<TAB>1` line changes nothing |
+| 12 | Errors | client switches on `error` code; `message` text nowhere in client logic |
+
+A quick server-side way to observe a client's request pattern (geomyidae logs
+every selector):
+
+```sh
+kubectl -n gopher-spot logs deploy/gopher-server --since=10m \
+  | grep 'serving' | awk '{print $1, $NF}'
+```
