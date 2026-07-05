@@ -16,10 +16,20 @@ pub const MAX_WIDTH: usize = 66;
 /// Clip a (possibly multi-byte) display string to [`MAX_WIDTH`] columns, adding
 /// an ellipsis when it overflows. Counts chars, not bytes, so accents don't eat
 /// budget; the MacRoman transcode at the IO edge maps each char to one byte.
+///
+/// Control characters are neutralized to spaces first (GS-03, the human-menu
+/// mirror of `api::kv`): a `\n`/`\r` smuggled in via a url-decoded query value
+/// (`?uri=x%0a[h|…]`) would otherwise become a second physical `.gph` line — a
+/// forged menu entry — and a `\t` would split gph fields. Every client-derived
+/// string is displayed through here, so this is the one chokepoint.
 pub fn clip(s: &str) -> String {
+    let s: String = s
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
     let n = s.chars().count();
     if n <= MAX_WIDTH {
-        return s.to_string();
+        return s;
     }
     let mut out: String = s.chars().take(MAX_WIDTH - 3).collect();
     out.push_str("...");

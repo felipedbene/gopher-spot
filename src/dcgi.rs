@@ -184,8 +184,17 @@ fn search(args: &DcgiArgs, api: Option<&dyn SpotifyApi>) -> String {
     }
 }
 
+/// Reject a client-supplied id that isn't base62 (GS-02) with the 404 page —
+/// same outcome as an id Spotify doesn't know.
+fn bad_id_page(kind: &str, id: &str) -> String {
+    page(not_found_entries(&format!("/spot/{kind}/{id}")))
+}
+
 fn track(id: &str, api: Option<&dyn SpotifyApi>) -> String {
     let id = id.trim_end_matches('/');
+    if !crate::spotify::valid_id(id) {
+        return bad_id_page("track", id);
+    }
     match api {
         Some(a) => match a.track(id) {
             Ok(t) => page(track_entries(&t)),
@@ -197,6 +206,9 @@ fn track(id: &str, api: Option<&dyn SpotifyApi>) -> String {
 
 fn album(id: &str, args: &DcgiArgs, api: Option<&dyn SpotifyApi>) -> String {
     let id = id.trim_end_matches('/');
+    if !crate::spotify::valid_id(id) {
+        return bad_id_page("album", id);
+    }
     let offset = args
         .query("offset")
         .and_then(|s| s.parse().ok())
@@ -214,6 +226,9 @@ fn album(id: &str, args: &DcgiArgs, api: Option<&dyn SpotifyApi>) -> String {
 
 fn artist(id: &str, _args: &DcgiArgs, api: Option<&dyn SpotifyApi>) -> String {
     let id = id.trim_end_matches('/');
+    if !crate::spotify::valid_id(id) {
+        return bad_id_page("artist", id);
+    }
     match api {
         // Top tracks is BEST-EFFORT: Spotify 403s /v1/artists/{id}/top-tracks for
         // apps without extended quota (the Nov-2024 Web API restriction — the same
@@ -234,6 +249,9 @@ fn artist(id: &str, _args: &DcgiArgs, api: Option<&dyn SpotifyApi>) -> String {
 
 fn artist_albums(id: &str, args: &DcgiArgs, api: Option<&dyn SpotifyApi>) -> String {
     let id = id.trim_end_matches('/');
+    if !crate::spotify::valid_id(id) {
+        return bad_id_page("artist", id);
+    }
     let offset = args
         .query("offset")
         .and_then(|s| s.parse().ok())
@@ -316,6 +334,9 @@ fn playlists(args: &DcgiArgs, api: Option<&dyn SpotifyApi>) -> String {
 
 fn playlist(id: &str, args: &DcgiArgs, api: Option<&dyn SpotifyApi>) -> String {
     let id = id.trim_end_matches('/');
+    if !crate::spotify::valid_id(id) {
+        return bad_id_page("playlists", id);
+    }
     let offset = args
         .query("offset")
         .and_then(|s| s.parse().ok())
@@ -701,7 +722,9 @@ fn playlist_tracks_entries(id: &str, t: &TracksPage) -> Vec<Entry> {
 /// a new `?offset=`.
 fn append_pager(e: &mut Vec<Entry>, base: &str, offset: u32, shown: usize, total: u32) {
     let has_prev = offset > 0;
-    let has_next = offset + (shown as u32) < total;
+    // saturating: an adversarial `?offset=` near u32::MAX must not overflow the
+    // add (GS-06) — saturation makes has_next false, so no bogus pager link.
+    let has_next = offset.saturating_add(shown as u32) < total;
     if has_prev || has_next {
         e.push(info(""));
     }
@@ -714,7 +737,7 @@ fn append_pager(e: &mut Vec<Entry>, base: &str, offset: u32, shown: usize, total
         ));
     }
     if has_next {
-        let next = offset + PAGE_SIZE;
+        let next = offset.saturating_add(PAGE_SIZE);
         e.push(link(
             ItemKind::Menu,
             ">> Proxima pagina",
@@ -775,10 +798,12 @@ fn not_found_entries(path: &str) -> Vec<Entry> {
 // ---- mock helpers (offline / no-Secret path) -------------------------------
 
 fn mock(title: &str, body: &str) -> String {
+    // clip also neutralizes control chars (GS-03) — several mock bodies echo a
+    // client-supplied uri/id, and this arm is reachable without any Secret.
     page(vec![
         info(title),
         info(""),
-        info(body),
+        info(clip(body)),
         info(""),
         link(ItemKind::Menu, "Voltar ao menu", "/"),
     ])
@@ -807,15 +832,22 @@ fn urldecode(s: &str) -> String {
     let mut i = 0;
     while i < b.len() {
         match b[i] {
-            b'%' if i + 2 < b.len() => {
-                if let Ok(h) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                    out.push(h);
+            // A %XX escape is consumed only when both following BYTES are ASCII
+            // hex — decided on the byte array, never by slicing the &str (GS-01:
+            // `&s[i+1..i+3]` through a multibyte char like `?q=%€` is not a char
+            // boundary and panics, aborting the request and — via geomyidae's
+            // stderr splice — corrupting the response). Anything else is a
+            // literal `%`.
+            b'%' => match (b.get(i + 1), b.get(i + 2)) {
+                (Some(&h), Some(&l)) if h.is_ascii_hexdigit() && l.is_ascii_hexdigit() => {
+                    out.push(hex_val(h) << 4 | hex_val(l));
                     i += 3;
-                    continue;
                 }
-                out.push(b'%');
-                i += 1;
-            }
+                _ => {
+                    out.push(b'%');
+                    i += 1;
+                }
+            },
             b'+' => {
                 out.push(b' ');
                 i += 1;
@@ -827,6 +859,15 @@ fn urldecode(s: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The value of an ASCII hex digit byte (caller guarantees `is_ascii_hexdigit`).
+fn hex_val(c: u8) -> u8 {
+    match c {
+        b'0'..=b'9' => c - b'0',
+        b'a'..=b'f' => c - b'a' + 10,
+        _ => c - b'A' + 10,
+    }
 }
 
 #[cfg(test)]
@@ -1273,5 +1314,68 @@ mod tests {
         // not four Latin-1 chars — the fio S3/4 API search?q= relies on this.
         let a = DcgiArgs::from_argv(&argv("", "/spot/api/1/search?q=constru%C3%A7%C3%A3o"));
         assert_eq!(a.query("q"), Some("construção".into()));
+    }
+
+    // ---- fio A2: audit hardening (GS-01/02/03/06) -------------------------------
+
+    #[test]
+    fn query_decode_percent_before_multibyte_does_not_panic() {
+        // GS-01: `%` followed by a multi-byte UTF-8 char used to slice the &str
+        // off a char boundary and panic — aborting the request and (via
+        // geomyidae's stderr splice) corrupting the response. It must decode as
+        // a literal `%`.
+        for q in ["%€", "%你好", "%😀x", "chico%", "a%2", "%zz", "%%C3%A7"] {
+            let a = DcgiArgs::from_argv(&argv("", &format!("/spot/api/1/search?q={q}")));
+            let _ = a.query("q"); // must not panic
+        }
+        let a = DcgiArgs::from_argv(&argv("", "/spot/api/1/search?q=%€"));
+        assert_eq!(a.query("q"), Some("%€".into()));
+    }
+
+    #[test]
+    fn traversal_ids_are_rejected_as_404() {
+        // GS-02: a non-base62 "id" like ../../v1/me must never reach the Web
+        // API path builder, where dot-normalization would redirect the
+        // authenticated GET onto arbitrary Spotify endpoints.
+        let f = fake();
+        for sel in [
+            "/spot/album/../../v1/me",
+            "/spot/track/../me",
+            "/spot/artist/a.b",
+            "/spot/artist/../x/albums",
+            "/spot/playlists/../../v1/me",
+        ] {
+            let out = r("", sel, Some(&f));
+            assert!(out.contains("404"), "{sel} must 404, got: {out}");
+        }
+        // Real base62 ids still route.
+        assert!(!r("", "/spot/album/qd", Some(&f)).contains("404"));
+    }
+
+    #[test]
+    fn newline_in_uri_cannot_forge_menu_lines() {
+        // GS-03: %0a in ?uri= decodes to \n; without neutralization the tail
+        // becomes a second physical .gph line — an injected menu entry. clip()
+        // now maps control chars to spaces on every display path, so no output
+        // line may start with the forged entry — on the live path AND the
+        // no-Secret mock path (which also echoes the uri).
+        let evil = "/spot/play?uri=x%0a[h|Click|URL:http://evil|server|port]";
+        let f = fake();
+        for api in [Some(&f as &dyn SpotifyApi), None] {
+            let out = r("", evil, api);
+            assert!(
+                out.lines().all(|l| !l.starts_with("[h|")),
+                "forged menu entry: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn pager_offset_near_max_does_not_overflow() {
+        // GS-06: an adversarial ?offset= near u32::MAX must not overflow the
+        // has_next add (panic in debug builds) nor emit a bogus pager link.
+        let f = fake();
+        let out = r("", "/spot/playlists?offset=4294967295", Some(&f));
+        assert!(!out.contains("Proxima pagina"), "{out}");
     }
 }

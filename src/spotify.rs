@@ -203,6 +203,15 @@ pub fn pick_image(images: &[Image], want_px: u32) -> Option<&Image> {
         .or_else(|| images.iter().max_by_key(|i| image_dim(i)))
 }
 
+/// A plausible Spotify id: non-empty base62 (`[A-Za-z0-9]+`). Client-supplied
+/// ids must pass this at the routing edge BEFORE being interpolated into a Web
+/// API path (GS-02): a raw `../../v1/me` id would otherwise dot-normalize the
+/// authenticated GET onto arbitrary Spotify endpoints. Rejection maps to
+/// not_found — indistinguishable from an id that doesn't exist.
+pub fn valid_id(id: &str) -> bool {
+    !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
 /// Extract the trailing id from a `spotify:kind:ID` uri. `None` for empty or
 /// malformed input (so callers fall back to a plain, non-clickable line).
 pub fn id_from_uri(uri: &str) -> Option<&str> {

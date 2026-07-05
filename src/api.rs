@@ -178,6 +178,10 @@ fn playlists_snapshot(p: &PlaylistsPage, now_ms: i64) -> String {
 /// `?offset=`.
 fn playlist_tracks_doc(api: &dyn SpotifyApi, args: &DcgiArgs, id: &str, now_ms: i64) -> String {
     let id = id.trim_end_matches('/');
+    // GS-02: a non-base62 id must not be interpolated into the Web API path.
+    if !crate::spotify::valid_id(id) {
+        return error("not_found", "unknown playlist");
+    }
     let offset = args
         .query("offset")
         .and_then(|s| s.parse().ok())
@@ -234,7 +238,9 @@ fn cover(api: &dyn SpotifyApi, rest: &str) -> Vec<u8> {
         Ok(s) if COVER_SIZES.contains(&s) => s,
         _ => return error("bad_range", "size must be 64, 300 or 640").into_bytes(),
     };
-    if album_id.is_empty() {
+    // Non-base62 ids (GS-02: `..`, `/`) never reach the Web API path — same
+    // not_found a nonexistent album gets.
+    if !crate::spotify::valid_id(album_id) {
         return error("not_found", "unknown album").into_bytes();
     }
     match api.album_cover(album_id, size) {
@@ -1025,6 +1031,17 @@ mod tests {
             let out = String::from_utf8(call_bytes(&f, sel)).unwrap();
             assert!(out.contains("error\tbad_range\r\n"), "{sel}: {out}");
         }
+    }
+
+    #[test]
+    fn non_base62_ids_are_not_found_at_the_api_edge() {
+        // GS-02: dotted ids must be rejected before reaching a Web API path,
+        // where dot-normalization would redirect the authenticated GET.
+        let f = fake(playing_track());
+        let cover = String::from_utf8(call_bytes(&f, "/spot/api/1/cover/../300")).unwrap();
+        assert!(cover.contains("error\tnot_found\r\n"), "{cover}");
+        let pl = call(&f, "/spot/api/1/playlists/..");
+        assert!(pl.contains("error\tnot_found\r\n"), "{pl}");
     }
 
     #[test]
