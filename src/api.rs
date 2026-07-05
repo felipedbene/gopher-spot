@@ -92,9 +92,11 @@ fn queue_add(api: &dyn SpotifyApi, args: &DcgiArgs, now_ms: i64) -> String {
         return error("bad_uri", "queue/add needs a spotify:track:<id> uri");
     }
     match api.queue_add(uri) {
-        // The queue changed, so a cached /now (with its stale queue_len) is now
-        // wrong — bust it, then return the fresh /queue snapshot (fio S3/2).
+        // The queue changed, so both the cached queue body and a cached /now
+        // (with its stale queue_len) are now wrong — bust both, then return the
+        // fresh /queue snapshot (fio S3/2).
         Ok(()) => {
+            api.invalidate_queue_cache();
             api.invalidate_now_cache();
             queue_doc(api, now_ms)
         }
@@ -309,11 +311,20 @@ fn wake(api: &dyn SpotifyApi, args: &DcgiArgs, now_ms: i64) -> String {
 /// Run a play/pause/next/prev command, then reply with a fresh snapshot. For the
 /// idempotent pair (`play`/`pause`), Spotify 403s "Restriction violated" when the
 /// player is already in the requested state — swallow that and return the
-/// snapshot, so `play` while playing is a no-op success (contract rule).
+/// snapshot, so `play` while playing is a no-op success (contract rule). The
+/// probe is gated on the error actually being a 403: on a 429/5xx the answer is
+/// already "no", and the extra player call would only feed the rate limiter.
 fn command(api: &dyn SpotifyApi, now_ms: i64, cmd: Control) -> String {
     match api.control(cmd) {
-        Ok(()) => fresh_now(api, now_ms),
-        Err(_) if already_in_state(api, cmd) => fresh_now(api, now_ms),
+        Ok(()) => {
+            // Only next/prev can change the upcoming queue; play/pause/volume
+            // keep the warm queue entry (its own 10s TTL covers drift).
+            if matches!(cmd, Control::Next | Control::Prev) {
+                api.invalidate_queue_cache();
+            }
+            fresh_now(api, now_ms)
+        }
+        Err(e) if e.contains("HTTP 403") && already_in_state(api, cmd) => fresh_now(api, now_ms),
         Err(e) => upstream(&e),
     }
 }
@@ -344,6 +355,14 @@ fn now_document(api: &dyn SpotifyApi, now_ms: i64) -> String {
     if let Some(cached) = api.cached_now(now_ms) {
         return cached;
     }
+    // Single-flight the miss path per replica (the GS-07 token pattern):
+    // concurrent per-request processes that all miss serialize here and re-check
+    // the cache after acquiring, so a poll burst costs one upstream fetch pair,
+    // not one per process. Held (via drop at end of scope) across fetch + store.
+    let _flight = api.now_fetch_lock();
+    if let Some(cached) = api.cached_now(now_ms) {
+        return cached;
+    }
     let playing = match api.now_playing() {
         Ok(p) => p,
         Err(e) if e.starts_with(crate::spotify::RATE_LIMITED) => {
@@ -354,7 +373,13 @@ fn now_document(api: &dyn SpotifyApi, now_ms: i64) -> String {
         }
         Err(e) => return upstream(&e),
     };
-    let queue_len = api.queue().map(|q| q.len()).unwrap_or(0);
+    // No track loaded -> nothing upcoming worth a second player call for; emit
+    // queue_len 0 (the key is documented best-effort) so an idle poller costs
+    // one upstream call per miss instead of two.
+    let queue_len = match playing.item {
+        None => 0,
+        Some(_) => api.queue().map(|q| q.len()).unwrap_or(0),
+    };
     let doc = snapshot(&playing, queue_len, now_ms);
     api.store_now(now_ms, &doc);
     doc
@@ -535,7 +560,9 @@ mod tests {
     /// fail control() (to exercise the idempotency + error paths).
     struct Fake {
         playing: Playing,
-        control_fails: bool,
+        /// `Some(err)` makes control() fail with that error (403 text for the
+        /// idempotency path; other errors must NOT trigger the now-probe).
+        control_err: Option<ApiError>,
         empty_queue: bool,
         last: RefCell<Option<Control>>,
         last_seek: RefCell<Option<u64>>,
@@ -545,6 +572,10 @@ mod tests {
         // poll burst folds to one fetch and a command busts it.
         now_calls: RefCell<u32>,
         now_cache: RefCell<Option<(i64, String)>>,
+        // Perf split: count upstream queue fetches and queue-cache busts, so
+        // tests can assert which commands pay the queue refetch.
+        queue_calls: RefCell<u32>,
+        queue_busts: RefCell<u32>,
         // fio S3/3 wake: `no_device` simulates librespot being unregistered;
         // `last_wake` records the play flag the endpoint passed.
         no_device: bool,
@@ -557,18 +588,24 @@ mod tests {
     fn fake(playing: Playing) -> Fake {
         Fake {
             playing,
-            control_fails: false,
+            control_err: None,
             empty_queue: false,
             last: RefCell::new(None),
             last_seek: RefCell::new(None),
             last_queued: RefCell::new(None),
             now_calls: RefCell::new(0),
             now_cache: RefCell::new(None),
+            queue_calls: RefCell::new(0),
+            queue_busts: RefCell::new(0),
             no_device: false,
             last_wake: RefCell::new(None),
             now_fails: None,
             stale_doc: None,
         }
+    }
+    /// The Spotify idempotency 403 the `control_fails` tests exercise.
+    fn restriction_403() -> Option<ApiError> {
+        Some("spotify HTTP 403: Restriction violated".into())
     }
     fn playing_track() -> Playing {
         Playing {
@@ -617,10 +654,14 @@ mod tests {
             *self.now_cache.borrow_mut() = None;
         }
         fn queue(&self) -> Result<Vec<Track>, ApiError> {
+            *self.queue_calls.borrow_mut() += 1;
             if self.empty_queue {
                 return Ok(Vec::new());
             }
             Ok(vec![track("Deus lhe Pague"), track("Cotidiano")])
+        }
+        fn invalidate_queue_cache(&self) {
+            *self.queue_busts.borrow_mut() += 1;
         }
         fn queue_add(&self, uri: &str) -> Result<(), ApiError> {
             *self.last_queued.borrow_mut() = Some(uri.to_string());
@@ -637,10 +678,9 @@ mod tests {
         }
         fn control(&self, cmd: Control) -> Result<(), ApiError> {
             *self.last.borrow_mut() = Some(cmd);
-            if self.control_fails {
-                Err("spotify HTTP 403: Restriction violated".into())
-            } else {
-                Ok(())
+            match &self.control_err {
+                Some(e) => Err(e.clone()),
+                None => Ok(()),
             }
         }
         fn seek(&self, position_ms: u64) -> Result<(), ApiError> {
@@ -815,7 +855,7 @@ mod tests {
     fn play_while_playing_is_idempotent_not_error() {
         // control() 403s "Restriction violated"; player already playing -> no error.
         let f = Fake {
-            control_fails: true,
+            control_err: restriction_403(),
             ..fake(playing_track())
         };
         let out = call(&f, "/spot/api/1/play");
@@ -830,7 +870,7 @@ mod tests {
     fn next_failure_surfaces_upstream_error() {
         // next is not idempotent-swallowed -> a control failure is a real error.
         let f = Fake {
-            control_fails: true,
+            control_err: restriction_403(),
             ..fake(playing_track())
         };
         let out = call(&f, "/spot/api/1/next");
@@ -1093,6 +1133,50 @@ mod tests {
         // rate limits must not be misclassified.
         assert!(upstream("spotify HTTP 500: rate_limited: nope")
             .contains("error\tupstream\r\n"));
+    }
+
+    // ---- perf fio: fewer upstream calls -----------------------------------------
+
+    #[test]
+    fn stopped_now_skips_the_queue_call() {
+        // No track loaded -> /now must not pay the second player call; the
+        // best-effort queue_len is emitted as 0.
+        let f = fake(stopped());
+        let out = call(&f, "/spot/api/1/now");
+        assert!(out.contains("queue_len\t0\r\n"), "{out}");
+        assert_eq!(*f.queue_calls.borrow(), 0, "queue() must not be called");
+    }
+
+    #[test]
+    fn only_queue_changing_commands_bust_the_queue_cache() {
+        // pause/volume/seek/wake can't change the queue -> keep the warm entry.
+        let f = fake(playing_track());
+        call(&f, "/spot/api/1/pause");
+        call(&f, "/spot/api/1/volume?50");
+        call(&f, "/spot/api/1/seek?1000");
+        call(&f, "/spot/api/1/wake");
+        assert_eq!(*f.queue_busts.borrow(), 0, "non-queue commands must not bust");
+        // next/prev/queue_add do change it -> one bust each.
+        call(&f, "/spot/api/1/next");
+        assert_eq!(*f.queue_busts.borrow(), 1);
+        call(&f, "/spot/api/1/prev");
+        assert_eq!(*f.queue_busts.borrow(), 2);
+        call(&f, "/spot/api/1/queue/add?spotify:track:xyz");
+        assert_eq!(*f.queue_busts.borrow(), 3);
+    }
+
+    #[test]
+    fn non_403_control_error_skips_the_now_probe() {
+        // A rate-limited (or 5xx) control failure already answers the
+        // idempotency question — probing now_playing would only add a player
+        // call while Spotify is throttling.
+        let f = Fake {
+            control_err: Some("rate_limited: spotify cooldown active (until ~9)".into()),
+            ..fake(playing_track())
+        };
+        let out = call(&f, "/spot/api/1/play");
+        assert!(out.contains("error\trate_limited\r\n"), "{out}");
+        assert_eq!(*f.now_calls.borrow(), 0, "no probe on a non-403 failure");
     }
 
     // ---- fio S3/3: device + wake ----------------------------------------------

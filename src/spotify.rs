@@ -285,6 +285,18 @@ pub trait SpotifyApi {
     /// Drop any cached `/now` so the next poll re-fetches. Commands call this so a
     /// state change is never masked by a stale cached snapshot.
     fn invalidate_now_cache(&self) {}
+    /// Drop the cached upcoming queue. Split from [`invalidate_now_cache`]: only
+    /// the commands that can actually change the queue (next/prev/queue_add) pay
+    /// the refetch; play/pause/volume/seek/wake keep the warm entry.
+    fn invalidate_queue_cache(&self) {}
+    /// Serialize concurrent `/now` miss fetches per replica (the GS-07 token
+    /// pattern): the returned handle holds an exclusive lock until drop, and the
+    /// caller re-checks the cache after acquiring, so a poll burst collapses to
+    /// one upstream fetch pair. `None` (default no-op, or a failed lock) means
+    /// proceed unserialized.
+    fn now_fetch_lock(&self) -> Option<std::fs::File> {
+        None
+    }
     /// The last good `/now` doc within the stale-serve window (~30s) — the 429
     /// fallback (fio 429): while Spotify is rate-limiting us, a poll gets the most
     /// recent snapshot instead of an error, so the client keeps rendering. The
@@ -320,8 +332,9 @@ mod net {
     const HTTP_TIMEOUT_SECS: u64 = 10;
     // Upcoming-queue cache (fio 429 / R1): `queue()` used to hit Spotify on every
     // call — and `/now` calls it for `queue_len` on every miss, doubling the
-    // player-endpoint rate. 10s is fresh enough for a queue display; commands and
-    // queue_add bust it via `invalidate_now_cache`.
+    // player-endpoint rate. 10s is fresh enough for a queue display; the
+    // queue-changing commands (next/prev/queue_add) bust it via
+    // `invalidate_queue_cache`.
     const QUEUE_TTL: i64 = 10;
     // /now micro-cache window (fio S3/2, widened by fio 429 / R2). Kept in
     // MILLISECONDS: the `now_snapshot` entry is written and read with the request
@@ -342,6 +355,13 @@ mod net {
     // the default, and the cap keeps a hostile/huge value from parking the bridge.
     const COOLDOWN_DEFAULT_SECS: i64 = 5;
     const COOLDOWN_MAX_SECS: i64 = 60;
+    // Negative-cache window for catalog 404s: a client retrying a bad album/
+    // playlist id would otherwise hit Spotify on every attempt (only success was
+    // cached). 5 min bounds how long a *newly created* resource could be masked.
+    const NEG_TTL: i64 = 300;
+    // The cached-404 sentinel body. A real body is JSON (or at least text) and
+    // can never start with a NUL byte, so the marker can't collide.
+    const NEG_404: &str = "\u{0}404";
 
     #[derive(Deserialize)]
     struct RawPlaylists {
@@ -460,7 +480,7 @@ mod net {
             if let Some(e) = self.cooldown_active() {
                 return Err(e);
             }
-            let _lock = flock_exclusive(&self.state_dir);
+            let _lock = flock_exclusive(&self.state_dir, "access_token.lock");
             // Re-check under the lock: another process may have refreshed while
             // we waited. Best-effort — if the lock couldn't be taken, this is
             // just the old (pre-GS-07) unserialized behavior.
@@ -562,6 +582,23 @@ mod net {
             res.map(|_| ()).map_err(|e| self.map_api_err(e))
         }
 
+        /// A JSON-body state change (play / transfer / play_context). Same breaker
+        /// discipline as `command`: cooldown-checked before any I/O, and a 429
+        /// arms the cooldown via `map_api_err`.
+        fn send_json(&self, method: &str, path: &str, body: &str) -> Result<(), ApiError> {
+            if let Some(e) = self.cooldown_active() {
+                return Err(e);
+            }
+            let token = self.access_token()?;
+            self.agent
+                .request(method, &format!("{API}{path}"))
+                .set("Authorization", &format!("Bearer {token}"))
+                .set("Content-Type", "application/json")
+                .send_string(body)
+                .map(|_| ())
+                .map_err(|e| self.map_api_err(e))
+        }
+
         /// Download raw bytes from a full URL (a Spotify CDN image — public, so no
         /// Authorization header). Reads the whole body into memory; cover JPEGs are
         /// a few tens of KB.
@@ -575,12 +612,25 @@ mod net {
         }
 
         /// GET `path` with the disk cache in front (TTL seconds), returning the
-        /// raw JSON body.
+        /// raw JSON body. A 404 is negative-cached (`NEG_TTL`) under the same
+        /// key, so a client retrying a bad id doesn't hammer upstream; the
+        /// replayed error keeps the `HTTP 404` marker the API layer maps on.
         fn get_cached(&self, key: &str, ttl: i64, path: &str) -> Result<String, ApiError> {
             if let Some(c) = cache::get(&self.state_dir, key, self.now_unix) {
+                if c == NEG_404 {
+                    return Err("spotify HTTP 404: (cached)".to_string());
+                }
                 return Ok(c);
             }
-            let s = self.get(path)?.into_string().map_err(|e| e.to_string())?;
+            let s = match self.get(path) {
+                Ok(resp) => resp.into_string().map_err(|e| e.to_string())?,
+                Err(e) => {
+                    if e.contains("HTTP 404") {
+                        cache::put(&self.state_dir, key, self.now_unix, NEG_TTL, NEG_404);
+                    }
+                    return Err(e);
+                }
+            };
             cache::put(&self.state_dir, key, self.now_unix, ttl, &s);
             Ok(s)
         }
@@ -651,8 +701,8 @@ mod net {
             // Cached (fio 429 / R1): `/now` calls this for `queue_len` on every
             // micro-cache miss, so uncached it doubled the player-endpoint rate.
             // Not via `get_cached`: a 204 (empty queue) has no body, so emptiness
-            // is cached as "" and mapped back to an empty vec on read. Commands
-            // and queue_add bust the entry through `invalidate_now_cache`.
+            // is cached as "" and mapped back to an empty vec on read. The
+            // queue-changing commands bust the entry via `invalidate_queue_cache`.
             let body = if let Some(c) = cache::get(&self.state_dir, "queue", self.now_unix) {
                 c
             } else {
@@ -744,7 +794,6 @@ mod net {
 
         fn play(&self, uri: &str) -> Result<(), ApiError> {
             let device = self.device_id()?;
-            let token = self.access_token()?;
             // A single track plays via `uris`; an album/artist/playlist is a
             // *context* (`context_uri`) so it plays the whole thing, not one song.
             let body = if uri.starts_with("spotify:track:") {
@@ -753,28 +802,15 @@ mod net {
                 serde_json::json!({ "context_uri": uri })
             }
             .to_string();
-            self.agent
-                .put(&format!("{API}/v1/me/player/play?device_id={device}"))
-                .set("Authorization", &format!("Bearer {token}"))
-                .set("Content-Type", "application/json")
-                .send_string(&body)
-                .map(|_| ())
-                .map_err(api_err)
+            self.send_json("PUT", &format!("/v1/me/player/play?device_id={device}"), &body)
         }
 
         fn wake(&self, play: bool) -> Result<(), ApiError> {
             // Transfer playback to gopher-spot. device_ids selects the target; the
             // `play` boolean is the Web API's native "resume on transfer" flag.
             let device = self.gopher_device_id_fresh()?;
-            let token = self.access_token()?;
             let body = serde_json::json!({ "device_ids": [device], "play": play }).to_string();
-            self.agent
-                .put(&format!("{API}/v1/me/player"))
-                .set("Authorization", &format!("Bearer {token}"))
-                .set("Content-Type", "application/json")
-                .send_string(&body)
-                .map(|_| ())
-                .map_err(api_err)
+            self.send_json("PUT", "/v1/me/player", &body)
         }
 
         fn control(&self, cmd: Control) -> Result<(), ApiError> {
@@ -800,7 +836,6 @@ mod net {
 
         fn play_context(&self, context_uri: &str, offset: u32) -> Result<(), ApiError> {
             let device = self.device_id()?;
-            let token = self.access_token()?;
             // offset.position is the 0-based index of the track to start on within
             // the context; the player then advances through the context in order.
             let body = serde_json::json!({
@@ -808,13 +843,7 @@ mod net {
                 "offset": { "position": offset },
             })
             .to_string();
-            self.agent
-                .put(&format!("{API}/v1/me/player/play?device_id={device}"))
-                .set("Authorization", &format!("Bearer {token}"))
-                .set("Content-Type", "application/json")
-                .send_string(&body)
-                .map(|_| ())
-                .map_err(api_err)
+            self.send_json("PUT", &format!("/v1/me/player/play?device_id={device}"), &body)
         }
 
         fn playlist_name(&self, id: &str) -> Result<String, ApiError> {
@@ -957,12 +986,17 @@ mod net {
             );
         }
         fn invalidate_now_cache(&self) {
+            // Only the snapshot: the queue cache has its own bust (below), paid
+            // only by queue-changing commands. The stale copy is deliberately
+            // KEPT — it's the 429 fallback, and its old `ts` makes it inert to a
+            // client's newest-wins guard.
             cache::remove(&self.state_dir, "now_snapshot");
-            // The queue cache rides the same bust: every command that can change
-            // playback state can also change the upcoming queue. The stale copy
-            // is deliberately KEPT — it's the 429 fallback, and its old `ts`
-            // makes it inert to a client's newest-wins guard.
+        }
+        fn invalidate_queue_cache(&self) {
             cache::remove(&self.state_dir, "queue");
+        }
+        fn now_fetch_lock(&self) -> Option<std::fs::File> {
+            flock_exclusive(&self.state_dir, "now_snapshot.lock")
         }
         fn stale_now(&self, now_ms: i64) -> Option<String> {
             cache::get(&self.state_dir, "now_snapshot_stale", now_ms)
@@ -983,22 +1017,23 @@ mod net {
             .unwrap_or(COOLDOWN_DEFAULT_SECS)
     }
 
-    /// Take an exclusive `flock` on `<dir>/access_token.lock`, blocking until
-    /// acquired (GS-07 single-flight). The lock lives exactly as long as the
-    /// returned handle: the fd's close on drop releases it, so there is no stale-
-    /// lock cleanup. Best-effort — `None` (couldn't create/lock) means the caller
-    /// proceeds unserialized, which is just the pre-GS-07 behavior.
-    fn flock_exclusive(dir: &std::path::Path) -> Option<std::fs::File> {
+    /// Take an exclusive `flock` on `<dir>/<name>`, blocking until acquired
+    /// (GS-07 single-flight, reused for the /now miss path). The lock lives
+    /// exactly as long as the returned handle: the fd's close on drop releases
+    /// it, so there is no stale-lock cleanup. Best-effort — `None` (couldn't
+    /// create/lock) means the caller proceeds unserialized, which is just the
+    /// pre-GS-07 behavior.
+    fn flock_exclusive(dir: &std::path::Path, name: &str) -> Option<std::fs::File> {
         use std::os::unix::io::AsRawFd;
         let _ = std::fs::create_dir_all(dir);
         let f = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
-            .open(dir.join("access_token.lock"))
+            .open(dir.join(name))
             .ok()?;
-        // LOCK_EX blocks; a refresh is one HTTP round-trip (≤ the 10s agent
-        // timeout), so waiters are parked briefly, not indefinitely.
+        // LOCK_EX blocks; the guarded work is one HTTP round-trip (≤ the 10s
+        // agent timeout), so waiters are parked briefly, not indefinitely.
         if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } == 0 {
             Some(f)
         } else {
@@ -1143,10 +1178,57 @@ mod net {
         fn flock_is_reacquirable_after_drop() {
             let dir = std::env::temp_dir().join("gopher-spot-test-flock");
             let _ = std::fs::remove_dir_all(&dir);
-            let l1 = flock_exclusive(&dir);
+            let l1 = flock_exclusive(&dir, "access_token.lock");
             assert!(l1.is_some(), "lock acquired");
             drop(l1); // fd close releases
-            assert!(flock_exclusive(&dir).is_some(), "reacquirable after drop");
+            assert!(
+                flock_exclusive(&dir, "access_token.lock").is_some(),
+                "reacquirable after drop"
+            );
+        }
+
+        #[test]
+        fn cooldown_blocks_send_json_before_network() {
+            // fio perf: play/wake/play_context used to bypass the breaker via
+            // bare api_err. send_json must short-circuit on the cooldown with
+            // the sentinel — the bogus path proves no request left the process.
+            let dir = std::env::temp_dir().join("gopher-spot-test-cooldown-json");
+            let _ = std::fs::remove_dir_all(&dir);
+            let c = client_at(&dir, 1_000);
+            cache::put(&dir, "spotify_cooldown", 1_000, 5, "1005");
+            let e = c.send_json("PUT", "/v1/never/called", "{}").unwrap_err();
+            assert!(e.starts_with(RATE_LIMITED), "got: {e}");
+        }
+
+        #[test]
+        fn cached_404_replays_without_network() {
+            // Negative cache: a sentinel entry under the key must come back as
+            // an HTTP 404 error (the marker the API layer maps to not_found)
+            // without any upstream call — the client has no real credentials,
+            // so a network attempt would error differently (or hang).
+            let dir = std::env::temp_dir().join("gopher-spot-test-neg404");
+            let _ = std::fs::remove_dir_all(&dir);
+            let c = client_at(&dir, 1_000);
+            cache::put(&dir, "plname:ghost", 1_000, NEG_TTL, NEG_404);
+            let e = c.playlist_name("ghost").unwrap_err();
+            assert!(e.contains("HTTP 404"), "got: {e}");
+        }
+
+        #[test]
+        fn queue_bust_is_split_from_now_bust() {
+            let dir = std::env::temp_dir().join("gopher-spot-test-bust-split");
+            let _ = std::fs::remove_dir_all(&dir);
+            let c = client_at(&dir, 1_000);
+            cache::put(&dir, "now_snapshot", 1_000, 3_000, "doc");
+            cache::put(&dir, "queue", 1_000, 10, "{}");
+            c.invalidate_now_cache();
+            assert!(cache::get(&dir, "now_snapshot", 1_000).is_none());
+            assert!(
+                cache::get(&dir, "queue", 1_000).is_some(),
+                "now bust must keep the queue entry"
+            );
+            c.invalidate_queue_cache();
+            assert!(cache::get(&dir, "queue", 1_000).is_none());
         }
     }
 }

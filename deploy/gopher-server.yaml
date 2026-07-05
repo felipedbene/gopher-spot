@@ -96,9 +96,13 @@ spec:
               mountPath: /var/cache/spot
       volumes:
         # Per-replica disk cache for the token + Web API results. emptyDir: it's
-        # a warm cache, nothing to persist across restarts.
+        # a warm cache, nothing to persist across restarts. sizeLimit (GS-04)
+        # backstops the entries the read-side reaper never revisits (search
+        # queries / covers nobody asks for again) — eviction of the pod at the
+        # cap beats node DiskPressure.
         - name: cache
-          emptyDir: {}
+          emptyDir:
+            sizeLimit: 256Mi
 ---
 apiVersion: v1
 kind: Service

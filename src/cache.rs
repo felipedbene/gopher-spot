@@ -24,10 +24,16 @@ fn key_file(dir: &Path, key: &str) -> PathBuf {
 }
 
 /// Return the cached payload for `key` if present and not past its expiry.
+/// An expired entry is removed on the way out (GS-04): reads are the only
+/// recurring visitor these files get, so this keeps re-requested keys from
+/// piling up dead generations. Best-effort — racing a concurrent re-put can at
+/// worst delete a just-renamed fresh entry, which is one extra cache miss.
 pub fn get(dir: &Path, key: &str, now_unix: i64) -> Option<String> {
-    let data = std::fs::read_to_string(key_file(dir, key)).ok()?;
+    let file = key_file(dir, key);
+    let data = std::fs::read_to_string(&file).ok()?;
     let (exp, payload) = data.split_once('\n')?;
     if now_unix >= exp.trim().parse::<i64>().ok()? {
+        let _ = std::fs::remove_file(&file);
         return None;
     }
     Some(payload.to_string())
@@ -65,11 +71,14 @@ fn write_atomic(file: &Path, bytes: &[u8]) {
 /// Same `expiry\npayload` framing as [`get`], but the payload may be arbitrary
 /// bytes (a JPEG cover), so we never go through `String`. The expiry prefix is
 /// always ASCII digits, so splitting on the first `\n` byte is unambiguous.
+/// Expired entries are removed on read, like [`get`] (GS-04).
 pub fn get_bytes(dir: &Path, key: &str, now_unix: i64) -> Option<Vec<u8>> {
-    let data = std::fs::read(key_file(dir, key)).ok()?;
+    let file = key_file(dir, key);
+    let data = std::fs::read(&file).ok()?;
     let nl = data.iter().position(|&b| b == b'\n')?;
     let exp: i64 = std::str::from_utf8(&data[..nl]).ok()?.trim().parse().ok()?;
     if now_unix >= exp {
+        let _ = std::fs::remove_file(&file);
         return None;
     }
     Some(data[nl + 1..].to_vec())
@@ -114,6 +123,19 @@ mod tests {
         put(&d, "devices", 1000, 30, "x");
         assert_eq!(get(&d, "devices", 1030), None);
         assert_eq!(get(&d, "devices", 5000), None);
+    }
+
+    #[test]
+    fn expired_entry_is_removed_on_read() {
+        // GS-04: the expired read is the reaper — after the miss, the file is
+        // gone (for both the string and byte variants).
+        let d = tmp("reap");
+        put(&d, "search:old", 1000, 30, "x");
+        put_bytes(&d, "cover:old:640", 1000, 30, &[0xFF, 0xD8]);
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 2);
+        assert_eq!(get(&d, "search:old", 2000), None);
+        assert_eq!(get_bytes(&d, "cover:old:640", 2000), None);
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 0, "reaped on read");
     }
 
     #[test]
