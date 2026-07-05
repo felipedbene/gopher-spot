@@ -504,6 +504,7 @@ them earned:
 | 12 | Spotify **403s playlist track reads for every playlist — including the user's own** (Nov-2024 dev-mode block, *not* a scope gap: the token has `playlist-read-private`). | Map 403→`forbidden`; list names/ids only; play playlists as a **context** (needs no track-read). |
 | 13 | `%XX` query decode as Latin-1 **mangles UTF-8** (`search?q=construção`). | Decode into bytes, then `from_utf8_lossy` (`DcgiArgs::query`). |
 | 14 | Spotify **player endpoints 429 at low volume** (one 2 s `/now` poller tripped it) and calling during the window prolongs it. | The layered defense in [Upstream protection](#upstream-protection-spotify-rate-limits): micro-cache + single-flight + `Retry-After` circuit breaker + stale-serve + session affinity. |
+| 15 | **External DNS silently dead on some nodes**: kubelet leaks the node's `search debene.dev …` into pods (`ndots:5`), the public `debene.dev` zone answers **NOERROR/empty** (not NXDOMAIN) for bogus subdomains, and musl's `getaddrinfo` treats that as terminal — librespot got "could not initialize spirc: Service unavailable" on any pod scheduled onto such a node, while `nslookup` (direct query) worked fine. | `dnsConfig: {options: [{name: ndots, value: "1"}]}` on both Deployments — FQDNs resolve absolute-first, the search path is never consulted (nothing uses short cluster-internal names). |
 
 ---
 

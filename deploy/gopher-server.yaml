@@ -43,6 +43,15 @@ spec:
       # fsGroup so nobody (65534) can write the cache emptyDir below.
       securityContext:
         fsGroup: 65534
+      # ndots:1 — same DNS immunization as audio-stream.yaml: resolve
+      # api/accounts.spotify.com as absolute names, never through the node's
+      # leaked search domains (the public debene.dev zone answers NOERROR/empty
+      # for bogus subdomains, which musl getaddrinfo treats as terminal). The
+      # dcgi never uses short cluster-internal names.
+      dnsConfig:
+        options:
+          - name: ndots
+            value: "1"
       containers:
         - name: gopher-server
           image: ghcr.io/felipedbene/gopher-spot-server:latest

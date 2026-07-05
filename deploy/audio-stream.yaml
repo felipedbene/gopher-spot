@@ -31,6 +31,19 @@ spec:
         - name: ghcr-pull
       # No hostNetwork, no nodeSelector — scheduler decides (PROMPT constraint).
       # The image is multi-arch, so it runs on amd64 or arm64 nodes alike.
+      #
+      # ndots:1 — resolve external FQDNs (apresolve/ap.spotify.com) as absolute
+      # names FIRST, never through the search path. kubelet leaks the node's
+      # `search debene.dev …` into pods, and the public debene.dev zone answers
+      # NOERROR/empty (not NXDOMAIN) for bogus subdomains, which musl's
+      # getaddrinfo treats as a final "no such host" — so on nodes with that
+      # search list, librespot couldn't resolve Spotify at all ("could not
+      # initialize spirc: Service unavailable"). Nothing here uses short
+      # cluster-internal names, so the search path isn't needed.
+      dnsConfig:
+        options:
+          - name: ndots
+            value: "1"
       containers:
         - name: audio-stream
           image: ghcr.io/felipedbene/gopher-spot-audio:latest
