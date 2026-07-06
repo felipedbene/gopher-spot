@@ -6,5 +6,6 @@ resources:
   - namespace.yaml
   - audio-stream.yaml
   - gopher-server.yaml
+  - log-sink.yaml        # UDP debug-telemetry sink for the family clients
   # - secrets.yaml         # created from secrets.yaml.template by the OAuth init
   #                        # script (Fio C); gitignored, never committed.

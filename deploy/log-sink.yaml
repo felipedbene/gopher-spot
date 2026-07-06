@@ -1,0 +1,89 @@
+# log-sink: a tiny UDP listener for the family clients' debug telemetry
+# (Casquinha b34+ mirrors every DbgLog line as one datagram — the
+# remote-syslog pattern). Clients point their "Casquinha Debug" marker file
+# at 10.0.100.114:5514; reading the stream is just:
+#
+#   kubectl -n gopher-spot logs -f deploy/log-sink
+#
+# Each line is prefixed with the sender's IP so several clients (Casquinha,
+# DeToca, DeGelato) can share the sink. Fire-and-forget UDP: the sink being
+# down never affects a client. The script lives in a ConfigMap — no custom
+# image to build; stock python:alpine runs it.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: log-sink-script
+  namespace: gopher-spot
+  labels:
+    app: log-sink
+data:
+  loglisten.py: |
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("0.0.0.0", 5514))
+    print("log-sink: listening on UDP :5514", flush=True)
+    while True:
+        data, addr = s.recvfrom(4096)
+        # Classic clients send MacRoman; decode so accents survive.
+        line = data.decode("mac_roman", errors="replace").rstrip("\r\n")
+        print(f"{addr[0]} {line}", flush=True)
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: log-sink
+  namespace: gopher-spot
+  labels:
+    app: log-sink
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: log-sink
+  template:
+    metadata:
+      labels:
+        app: log-sink
+    spec:
+      containers:
+        - name: log-sink
+          image: python:3.12-alpine
+          command: ["python3", "-u", "/app/loglisten.py"]
+          ports:
+            - containerPort: 5514
+              protocol: UDP
+          volumeMounts:
+            - name: script
+              mountPath: /app
+              readOnly: true
+          resources:
+            requests:
+              cpu: 5m
+              memory: 16Mi
+            limits:
+              memory: 64Mi
+      volumes:
+        - name: script
+          configMap:
+            name: log-sink-script
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: log-sink
+  namespace: gopher-spot
+  labels:
+    app: log-sink
+  annotations:
+    # Pinned: this address gets baked into client-side marker files
+    # ("Casquinha Debug" first line = host:port), so it must not drift.
+    metallb.universe.tf/loadBalancerIPs: 10.0.100.114
+spec:
+  type: LoadBalancer
+  ports:
+    - port: 5514
+      targetPort: 5514
+      protocol: UDP
+      name: udp-log
+  selector:
+    app: log-sink
