@@ -373,6 +373,14 @@ cover-forward player, the "up next" queue with thumbnails, track search, the
 playlists list with context play, and `device`/`wake` recovery — see
 [DeToca's README](https://github.com/felipedbene/detoca#the-full-radinho-fio-10).
 
+**Three native clients** speak `/spot/api/1`, one per rung of the vintage ladder:
+[DeToca](https://github.com/felipedbene/detoca) (Mac OS X 10.6),
+[DeGelato](https://github.com/felipedbene/degelato) (Sorbet Leopard 10.5 / PowerPC),
+and [Casquinha](https://github.com/felipedbene/casquinha) (Mac OS 9.2 / classic
+Toolbox — the oldest machine yet). They all follow one recipe,
+[**fhb ▸ CLIENT-PATTERN.md**](https://github.com/felipedbene/fhb/blob/main/CLIENT-PATTERN.md),
+against the rules in [`CLIENTS.md`](CLIENTS.md).
+
 > **⚠ handlecgi trap.** geomyidae's `handlecgi` splices the child's **stderr** into
 > the client socket, so any `eprintln!`/panic on an API request path prepends bytes
 > to the response — invisible on text, but it *corrupts the cover JPEG*. Rule:
