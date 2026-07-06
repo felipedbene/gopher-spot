@@ -21,7 +21,7 @@ design brief and [the build story](#build-story) for what it cost.
 - [How a "play this track" request flows](#how-a-play-this-track-request-flows)
 - [Code map (UML)](#code-map-uml)
 - [dcgi routing](#dcgi-routing)
-- [The machine API (for the DeToca client)](#the-machine-api-for-the-detoca-client)
+- [The machine API (for the native clients)](#the-machine-api-for-the-native-clients)
 - [Upstream protection (Spotify rate limits)](#upstream-protection-spotify-rate-limits)
 - [Audio delivery: the Icecast fallback](#audio-delivery-the-icecast-fallback)
 - [Design decisions](#design-decisions)
@@ -179,7 +179,7 @@ classDiagram
     class api {
         <<module — machine API /spot/api/1>>
         now/play/pause/next/prev/volume/seek
-        queue, queue/add, cover(JPEG), wake, search
+        queue, queue/add, play/from, cover(JPEG), wake, search
         playlists, playlists/[id]
         ~3s /now micro-cache + 429 stale fallback
     }
@@ -321,7 +321,7 @@ flowchart LR
 ```
 
 `main` splits on the path first: `/spot/api/*` goes to `api::route` (raw bytes —
-the [machine API](#the-machine-api-for-the-detoca-client)), everything else to the
+the [machine API](#the-machine-api-for-the-native-clients)), everything else to the
 human `dcgi::route`. Both take `Option<&dyn SpotifyApi>`: `Some` on the live path,
 `None` when the OAuth Secret is absent — the human router then serves mock menus
 and the machine API an in-contract `upstream` error, instead of crashing.
@@ -331,11 +331,12 @@ must be served raw, not interpreted as a menu.
 
 ---
 
-## The machine API (for the DeToca client)
+## The machine API (for the native clients)
 
 The human Gopher menus are PT-BR gophermaps meant for a person driving Netscape on
-Mac OS 9. A second consumer — **[DeToca](https://github.com/felipedbene/detoca)**, a
-native **Mac OS X 10.6** client (Snow Leopard, non-ARC Cocoa) — needs a stable,
+Mac OS 9. The native clients — first **[DeToca](https://github.com/felipedbene/detoca)**, a
+native **Mac OS X 10.6** client (Snow Leopard, non-ARC Cocoa), then DeGelato and
+Casquinha (below) — need a stable,
 machine-parseable surface instead of scraping localized menu text. That's the
 **machine API** at **`/spot/api/1/*`**: a frozen, versioned contract. Full spec in
 [`API.md`](API.md); the shape:
@@ -354,6 +355,7 @@ machine-parseable surface instead of scraping localized menu text. That's the
 | `now` | playback snapshot: `state`, track/artist/album, `album_id`, `position_ms`/`duration_ms`, `volume`, `queue_len`, **`device active\|idle`**, `ts`. Cached **~3 s** (a poll burst = one upstream fetch; commands bust it); during a Spotify 429 cooldown it serves the last good snapshot (≤30 s, original `ts`) before surfacing `error rate_limited`. |
 | `play` `pause` `next` `prev` `volume?N` `seek?N` | transport; each replies with a fresh `now` snapshot. |
 | `queue` · `queue/add?<uri>` | upcoming tracks; enqueue a track. No `queue/clear` (the Web API has none). |
+| `play/from?ids=…&offset=N` | native "play from here onward": start an explicit list (≤24 bare base62 track ids) at `offset`; Spotify owns the continuation (auto-advance, `next`/`prev` in-list). Old servers answer `not_found` — the client's feature-detect. |
 | `cover/<album_id>/<size>` | **raw JPEG** (type-`I`), sizes 64/300/640, disk-cached 24 h. The one binary endpoint. |
 | `search?q=<urlencoded>` | track search (UTF-8 query); capped at 10 (Spotify 400s `limit>10`). |
 | `wake[?play=1]` | transfer playback to the gopher-spot device (recover a `device idle`); `no_device` if librespot is down. |
@@ -401,7 +403,7 @@ between every client and Spotify:
 | Single-flight | Concurrent cache misses in one replica serialize on a lockfile — for the `/now` fetch *and* the token refresh — so a burst costs one upstream call, not one per dcgi process. |
 | Circuit breaker | Any Web-API 429 arms a cooldown from `Retry-After` (default 5 s, capped 60 s). While armed, **no request leaves the bridge**: every call path short-circuits, letting Spotify's window actually drain. |
 | Stale-serve | During a cooldown, `/now` returns the last good snapshot (≤30 s old, original `ts`) instead of an error, so a polling client keeps rendering; past that it's `error rate_limited`. |
-| Call minimization | The queue is cached 10 s and busted only by queue-changing commands (next/prev/queue-add); `/now` skips the queue call entirely when stopped; catalog 404s are negative-cached 5 min; the play/pause idempotency probe fires only on a real 403. |
+| Call minimization | The queue is cached 10 s and busted only by queue-changing commands (next/prev/queue-add/play-from); `/now` skips the queue call entirely when stopped; catalog 404s are negative-cached 5 min; the play/pause idempotency probe fires only on a real 403. |
 | Session affinity | `sessionAffinity: ClientIP` on the Service pins each client to one replica, so the per-replica caches are actually warm for a steady poller. |
 
 Measured effect when this landed: **~60 player calls/min → ~17** for a 2 s
@@ -595,13 +597,14 @@ The lopsided ratio — features in an evening, one audio bug across a morning �
 the real lesson: gluing modern SaaS to vintage clients, the protocol translation
 is easy; the **stateful media plane** is where the time goes.
 
-**Since then** (2026-07-02/05) the project roughly doubled: a navigable music
+**Since then** (2026-07-02/06) the project roughly doubled: a navigable music
 graph (album/artist/discography pages), the switch to **Latin-1** for Netscape,
 inline transport controls, audio robustness (FIFO respawn + internal drainer),
-the whole **`/spot/api/1` machine API** for the DeToca client (`now`/transport,
-`queue`, `cover`, `search`, `device`+`wake`, `playlists`, context play), and the
+the whole **`/spot/api/1` machine API** for the native clients (`now`/transport,
+`queue`, `cover`, `search`, `device`+`wake`, `playlists`, context play,
+`play/from` list playback), and the
 **rate-limit hardening** ([Upstream protection](#upstream-protection-spotify-rate-limits)).
-Current totals: **~38 commits, ~4,600 lines of Rust, 97 tests.**
+Current totals: **~44 commits, ~5,000 lines of Rust, 112 tests.**
 
 ---
 

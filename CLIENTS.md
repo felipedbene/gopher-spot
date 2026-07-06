@@ -4,7 +4,7 @@ How a well-behaved client uses the bridge. The server defends Spotify's rate
 limits on its own ([README → Upstream protection](README.md#upstream-protection-spotify-rate-limits)),
 but a sloppy client can still waste round-trips, fight the caches, or turn a
 throttling blip into a frozen UI. Use the [checklist](#spot-check-checklist) to
-audit a client (Casquinha / DeToca / anything new).
+audit a client (DeToca / DeGelato / Casquinha / anything new).
 
 The wire contract itself (endpoints, keys, error codes) is [`API.md`](API.md);
 this document is only about *how to consume it well*.
@@ -72,16 +72,26 @@ this document is only about *how to consume it well*.
 
 ## Commands and device state
 
-18. **`wake` is a user action, not a reflex.** Offer it when `device` is `idle`;
+18. **Jumping into a list: one `play/from`, never chained skips or a client-side
+    sequencer.** Send the tail of the visible list (or the whole list plus
+    `offset`) as comma-joined **bare** base62 ids — `play/from?ids=…&offset=N`,
+    ≤24 ids — and Spotify owns the continuation (auto-advance, `next`/`prev`
+    within the list). Do **not** jump via a single-track play and then chain
+    `/next`, and do **not** sequence tracks client-side with an end-of-track
+    watchdog: the single-track context stops dead at the track's end. On
+    `error not_found` (an older server without the endpoint) fall back
+    gracefully — the new sub exists precisely so old servers answer that
+    cleanly.
+19. **`wake` is a user action, not a reflex.** Offer it when `device` is `idle`;
     never auto-`wake` in a poll loop (a phone user would fight the bridge for
     the playback session).
-19. **Trust the server's clamps.** `seek` clamps to the track duration and
+20. **Trust the server's clamps.** `seek` clamps to the track duration and
     `volume` rejects out-of-range values server-side; client-side pre-validation
     is only a UX nicety.
-20. **Expect eventual consistency after `seek`/`volume`.** The reply snapshot
+21. **Expect eventual consistency after `seek`/`volume`.** The reply snapshot
     can still show the pre-command value; it settles within ~1–2 s of polling.
     Don't re-issue the command because the echo looks stale.
-21. **Parse forward-compatibly.** `key<TAB>value`, CRLF lines, UTF-8. Ignore
+22. **Parse forward-compatibly.** `key<TAB>value`, CRLF lines, UTF-8. Ignore
     unknown keys (v1 grows additively) and tolerate keys appearing in any order.
     Metadata keys (`track`…`duration_ms`) exist only when a track is loaded —
     key off `state` first.
@@ -105,6 +115,7 @@ tick these off:
 | 10 | `wake` | only after user intent, never automatic |
 | 11 | Unknown keys | feeding the client an extra `x_test<TAB>1` line changes nothing |
 | 12 | Errors | client switches on `error` code; `message` text nowhere in client logic |
+| 13 | List jump | one `play/from` per jump; no `/next` chains; no end-of-track watchdog issuing plays |
 
 A quick server-side way to observe a client's request pattern (geomyidae logs
 every selector):

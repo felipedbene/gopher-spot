@@ -1,5 +1,5 @@
 //! The machine API — a frozen, versioned contract at `/spot/api/1/*` for the
-//! DeToca client (fio S1).
+//! native clients (DeToca, DeGelato, Casquinha; introduced for DeToca, fio S1).
 //!
 //! Unlike the human menus (gophermaps in PT-BR served by a `.dcgi`), every API
 //! endpoint is a plain **type-0 text document**: `key<TAB>value` lines, UTF-8,
@@ -55,6 +55,11 @@ pub fn route(path: &str, args: &DcgiArgs, api: Option<&dyn SpotifyApi>, now_ms: 
     let text = match sub {
         "now" => now_document(api, now_ms),
         "play" => command(api, now_ms, Control::Resume),
+        // A NEW sub, not a query on `play`: `path()` strips the query, so an old
+        // server would silently match `play?ids=…` to the resume arm above. As
+        // its own selector, old servers answer `not_found` — the client's clean
+        // feature-detect signal (Casquinha falls back to its b40 behavior).
+        "play/from" => play_from(api, args, now_ms),
         "pause" => command(api, now_ms, Control::Pause),
         "next" => command(api, now_ms, Control::Next),
         "prev" => command(api, now_ms, Control::Prev),
@@ -257,6 +262,66 @@ fn cover(api: &dyn SpotifyApi, rest: &str) -> Vec<u8> {
 /// A well-formed `spotify:track:<id>` uri (non-empty id, no trailing segment).
 fn is_track_uri(uri: &str) -> bool {
     uri.starts_with("spotify:track:") && crate::spotify::id_from_uri(uri).is_some()
+}
+
+/// Cap on the `play/from` id list. The binding constraint is geomyidae's
+/// request-line buffer, not Spotify: 24 bare ids ≈ 580 bytes of selector stays
+/// comfortably inside it.
+const PLAY_FROM_MAX_IDS: usize = 24;
+
+/// A plausible **bare** track id: exactly 22 base62 chars — the tail of
+/// `spotify:track:<id>`. Stricter than `valid_id` on purpose: the shape is
+/// fixed-width, and rejecting anything else keeps ids un-interpolatable into a
+/// Web API path (GS-02) and catches a client sending full uris by mistake.
+fn is_track_id(id: &str) -> bool {
+    id.len() == 22 && id.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// `/play/from?ids=<id1>,…,<idK>&offset=<n>`: start playback of an explicit
+/// track list at index `offset` — the native "play from here onward". One
+/// upstream PUT hands Spotify the whole list, so Spotify owns the continuation
+/// (auto-advance at track end, next/prev within the list); the single-uri jump
+/// path leaves a one-track context that stops dead at the track's end.
+fn play_from(api: &dyn SpotifyApi, args: &DcgiArgs, now_ms: i64) -> String {
+    let ids_raw = match args.query("ids") {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => return error("bad_query", "play/from needs a non-empty ids list"),
+    };
+    let ids: Vec<String> = ids_raw.split(',').map(|s| s.trim().to_string()).collect();
+    if ids.len() > PLAY_FROM_MAX_IDS {
+        return error(
+            "bad_range",
+            &format!("at most {PLAY_FROM_MAX_IDS} ids per call"),
+        );
+    }
+    if let Some(bad) = ids.iter().find(|id| !is_track_id(id)) {
+        return error("bad_uri", &format!("not a bare base62 track id: {bad}"));
+    }
+    let offset = match args.query("offset") {
+        None => 0,
+        Some(s) => match s.trim().parse::<u32>() {
+            Ok(n) if (n as usize) < ids.len() => n,
+            Ok(n) => {
+                return error(
+                    "bad_range",
+                    &format!("offset {n} is outside the {}-item list", ids.len()),
+                )
+            }
+            Err(_) => return error("bad_range", "offset must be a non-negative integer"),
+        },
+    };
+    match api.play_uris(&ids, offset) {
+        Ok(()) => {
+            // Jumping into a list replaces the upcoming tracks, so the cached
+            // queue is stale — same bust next/prev pay.
+            api.invalidate_queue_cache();
+            fresh_now(api, now_ms)
+        }
+        Err(e) if e.contains("no_device") => {
+            error("no_device", "gopher-spot device is not registered")
+        }
+        Err(e) => upstream(&e),
+    }
 }
 
 /// `/volume?<0-100>`: continuous. Out of range (or non-integer) -> `bad_range`.
@@ -573,6 +638,8 @@ mod tests {
         last: RefCell<Option<Control>>,
         last_seek: RefCell<Option<u64>>,
         last_queued: RefCell<Option<String>>,
+        /// play/from: the (ids, offset) the endpoint handed to play_uris.
+        last_play_from: RefCell<Option<(Vec<String>, u32)>>,
         // fio S3/2 micro-cache: count upstream now_playing fetches, and back the
         // cache with an in-memory (expiry_ms, doc) slot so a test can assert a
         // poll burst folds to one fetch and a command busts it.
@@ -599,6 +666,7 @@ mod tests {
             last: RefCell::new(None),
             last_seek: RefCell::new(None),
             last_queued: RefCell::new(None),
+            last_play_from: RefCell::new(None),
             now_calls: RefCell::new(0),
             now_cache: RefCell::new(None),
             queue_calls: RefCell::new(0),
@@ -718,6 +786,18 @@ mod tests {
             Ok(())
         }
         fn play_context(&self, _c: &str, _o: u32) -> Result<(), ApiError> {
+            Ok(())
+        }
+        fn play_uris(&self, ids: &[String], offset: u32) -> Result<(), ApiError> {
+            // Failure knobs mirror the endpoints this composes with: `no_device`
+            // (like wake) and `control_err` (upstream/sentinel mapping).
+            if self.no_device {
+                return Err("no_device: 'gopher-spot' is not registered".into());
+            }
+            if let Some(e) = &self.control_err {
+                return Err(e.clone());
+            }
+            *self.last_play_from.borrow_mut() = Some((ids.to_vec(), offset));
             Ok(())
         }
         fn playlists(&self, offset: u32) -> Result<PlaylistsPage, ApiError> {
@@ -1148,8 +1228,7 @@ mod tests {
         assert!(upstream("spotify HTTP 500: boom").contains("error\tupstream\r\n"));
         // Only the PREFIX triggers it — a 500 whose body happens to mention
         // rate limits must not be misclassified.
-        assert!(upstream("spotify HTTP 500: rate_limited: nope")
-            .contains("error\tupstream\r\n"));
+        assert!(upstream("spotify HTTP 500: rate_limited: nope").contains("error\tupstream\r\n"));
     }
 
     // ---- perf fio: fewer upstream calls -----------------------------------------
@@ -1172,14 +1251,20 @@ mod tests {
         call(&f, "/spot/api/1/volume?50");
         call(&f, "/spot/api/1/seek?1000");
         call(&f, "/spot/api/1/wake");
-        assert_eq!(*f.queue_busts.borrow(), 0, "non-queue commands must not bust");
-        // next/prev/queue_add do change it -> one bust each.
+        assert_eq!(
+            *f.queue_busts.borrow(),
+            0,
+            "non-queue commands must not bust"
+        );
+        // next/prev/queue_add/play_from do change it -> one bust each.
         call(&f, "/spot/api/1/next");
         assert_eq!(*f.queue_busts.borrow(), 1);
         call(&f, "/spot/api/1/prev");
         assert_eq!(*f.queue_busts.borrow(), 2);
         call(&f, "/spot/api/1/queue/add?spotify:track:xyz");
         assert_eq!(*f.queue_busts.borrow(), 3);
+        call(&f, "/spot/api/1/play/from?ids=7hQJA50XrCWABAu5v6QZ4i");
+        assert_eq!(*f.queue_busts.borrow(), 4);
     }
 
     #[test]
@@ -1328,5 +1413,133 @@ mod tests {
         let f = fake(playing_track());
         let out = call(&f, "/spot/api/1/playlists/blocked");
         assert!(out.contains("error\tforbidden\r\n"), "{out}");
+    }
+
+    // ---- play/from: native "play from here onward" ------------------------------
+
+    /// Two well-formed 22-char base62 track ids (the spec's wire examples).
+    const ID_A: &str = "7hQJA50XrCWABAu5v6QZ4i";
+    const ID_B: &str = "22HMAUrbbYSj9NiPPlGumy";
+
+    #[test]
+    fn play_from_starts_list_and_returns_now_snapshot() {
+        let f = fake(playing_track());
+        let out = call(
+            &f,
+            &format!("/spot/api/1/play/from?ids={ID_A},{ID_B}&offset=1"),
+        );
+        assert_wire(&out);
+        assert_eq!(
+            *f.last_play_from.borrow(),
+            Some((vec![ID_A.to_string(), ID_B.to_string()], 1))
+        );
+        assert!(!out.contains("error\t"), "{out}");
+        assert!(out.contains("state\tplaying\r\n")); // a /now snapshot, per convention
+        assert!(out.contains("ts\t"));
+    }
+
+    #[test]
+    fn play_from_offset_defaults_to_zero() {
+        let f = fake(playing_track());
+        call(&f, &format!("/spot/api/1/play/from?ids={ID_A}"));
+        assert_eq!(f.last_play_from.borrow().as_ref().unwrap().1, 0);
+    }
+
+    #[test]
+    fn play_from_missing_or_empty_ids_is_bad_query() {
+        let f = fake(playing_track());
+        assert!(call(&f, "/spot/api/1/play/from").contains("error\tbad_query\r\n"));
+        assert!(call(&f, "/spot/api/1/play/from?ids=").contains("error\tbad_query\r\n"));
+        assert!(call(&f, "/spot/api/1/play/from?offset=0").contains("error\tbad_query\r\n"));
+    }
+
+    #[test]
+    fn play_from_rejects_implausible_ids() {
+        let f = fake(playing_track());
+        let bad = [
+            "short".to_string(),             // not 22 chars
+            format!("spotify:track:{ID_A}"), // full uri, not a bare id
+            format!("{ID_A},.."),            // GS-02: dotted segment
+            format!("{ID_A},,{ID_B}"),       // empty segment
+        ];
+        for ids in &bad {
+            let out = call(&f, &format!("/spot/api/1/play/from?ids={ids}"));
+            assert!(out.contains("error\tbad_uri\r\n"), "{ids}: {out}");
+        }
+        assert!(
+            f.last_play_from.borrow().is_none(),
+            "a rejected list must never reach spotify"
+        );
+    }
+
+    #[test]
+    fn play_from_offset_out_of_range_is_bad_range() {
+        let f = fake(playing_track());
+        // ≥ K (the 1-item boundary), non-numeric, negative.
+        for sel in [
+            format!("/spot/api/1/play/from?ids={ID_A}&offset=1"),
+            format!("/spot/api/1/play/from?ids={ID_A}&offset=3"),
+            format!("/spot/api/1/play/from?ids={ID_A}&offset=abc"),
+            format!("/spot/api/1/play/from?ids={ID_A}&offset=-1"),
+        ] {
+            assert!(call(&f, &sel).contains("error\tbad_range\r\n"), "{sel}");
+        }
+        assert!(f.last_play_from.borrow().is_none());
+        // The last valid index is fine.
+        let ok = call(
+            &f,
+            &format!("/spot/api/1/play/from?ids={ID_A},{ID_B}&offset=1"),
+        );
+        assert!(!ok.contains("error\t"), "{ok}");
+    }
+
+    #[test]
+    fn play_from_caps_the_id_list_at_24() {
+        let f = fake(playing_track());
+        let ids24 = vec![ID_A; 24].join(",");
+        assert!(!call(&f, &format!("/spot/api/1/play/from?ids={ids24}")).contains("error\t"));
+        let ids25 = vec![ID_A; 25].join(",");
+        assert!(call(&f, &format!("/spot/api/1/play/from?ids={ids25}"))
+            .contains("error\tbad_range\r\n"));
+    }
+
+    #[test]
+    fn play_from_busts_queue_and_now_caches() {
+        let f = fake(playing_track());
+        now_at(&f, TS); // caches /now (fetch #1)
+        let args = DcgiArgs::from_argv(&argv(&format!("/spot/api/1/play/from?ids={ID_A}")));
+        route(&args.path(), &args, Some(&f), TS + 100);
+        assert_eq!(
+            *f.queue_busts.borrow(),
+            1,
+            "a jump replaces the upcoming queue"
+        );
+        assert_eq!(*f.now_calls.borrow(), 2, "reply must be a fresh snapshot");
+    }
+
+    #[test]
+    fn play_from_no_device_is_no_device_error() {
+        let f = Fake {
+            no_device: true,
+            ..fake(playing_track())
+        };
+        let out = call(&f, &format!("/spot/api/1/play/from?ids={ID_A}"));
+        assert!(out.contains("error\tno_device\r\n"), "{out}");
+    }
+
+    #[test]
+    fn play_from_upstream_failure_maps_via_sentinel() {
+        let f = Fake {
+            control_err: Some("rate_limited: spotify cooldown active (until ~9)".into()),
+            ..fake(playing_track())
+        };
+        let out = call(&f, &format!("/spot/api/1/play/from?ids={ID_A}"));
+        assert!(out.contains("error\trate_limited\r\n"), "{out}");
+        let f2 = Fake {
+            control_err: Some("spotify HTTP 500: boom".into()),
+            ..fake(playing_track())
+        };
+        let out2 = call(&f2, &format!("/spot/api/1/play/from?ids={ID_A}"));
+        assert!(out2.contains("error\tupstream\r\n"), "{out2}");
     }
 }

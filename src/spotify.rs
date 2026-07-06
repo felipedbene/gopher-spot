@@ -258,6 +258,12 @@ pub trait SpotifyApi {
     /// next/prev follow that order instead of the autoplay radio. Distinct from
     /// `play(uri)`, which plays a single track with no context.
     fn play_context(&self, context_uri: &str, offset: u32) -> Result<(), ApiError>;
+    /// Play an explicit **track list** starting at index `offset` (`PUT
+    /// /v1/me/player/play` with a `uris` array + `offset.position`). `ids` are
+    /// bare base62 track ids (the caller validates their shape). Spotify owns
+    /// the continuation: auto-advance at track end, next/prev within the list —
+    /// unlike `play(uri)`, whose single-track context stops at the track's end.
+    fn play_uris(&self, ids: &[String], offset: u32) -> Result<(), ApiError>;
     /// The user's playlists, paginated (offset in items).
     fn playlists(&self, offset: u32) -> Result<PlaylistsPage, ApiError>;
     /// A playlist's tracks, paginated.
@@ -732,8 +738,8 @@ mod net {
                 #[serde(default = "Vec::new")]
                 queue: Vec<Track>,
             }
-            let q: RawQueue = serde_json::from_str(&body)
-                .map_err(|e| format!("queue parse failed: {e}"))?;
+            let q: RawQueue =
+                serde_json::from_str(&body).map_err(|e| format!("queue parse failed: {e}"))?;
             Ok(q.queue)
         }
 
@@ -811,7 +817,11 @@ mod net {
                 serde_json::json!({ "context_uri": uri })
             }
             .to_string();
-            self.send_json("PUT", &format!("/v1/me/player/play?device_id={device}"), &body)
+            self.send_json(
+                "PUT",
+                &format!("/v1/me/player/play?device_id={device}"),
+                &body,
+            )
         }
 
         fn wake(&self, play: bool) -> Result<(), ApiError> {
@@ -852,7 +862,20 @@ mod net {
                 "offset": { "position": offset },
             })
             .to_string();
-            self.send_json("PUT", &format!("/v1/me/player/play?device_id={device}"), &body)
+            self.send_json(
+                "PUT",
+                &format!("/v1/me/player/play?device_id={device}"),
+                &body,
+            )
+        }
+
+        fn play_uris(&self, ids: &[String], offset: u32) -> Result<(), ApiError> {
+            let device = self.device_id()?;
+            self.send_json(
+                "PUT",
+                &format!("/v1/me/player/play?device_id={device}"),
+                &play_uris_body(ids, offset),
+            )
         }
 
         fn playlist_name(&self, id: &str) -> Result<String, ApiError> {
@@ -1064,6 +1087,14 @@ mod net {
         }
     }
 
+    /// The `PUT /v1/me/player/play` body for a bare track-id list: the ids
+    /// expanded to full `spotify:track:` uris plus the 0-based `offset.position`
+    /// to start at. Split from the send so the JSON shape is testable offline.
+    fn play_uris_body(ids: &[String], offset: u32) -> String {
+        let uris: Vec<String> = ids.iter().map(|id| format!("spotify:track:{id}")).collect();
+        serde_json::json!({ "uris": uris, "offset": { "position": offset } }).to_string()
+    }
+
     /// Minimal percent-encoding for a search query (RFC 3986 unreserved kept).
     fn urlencode(s: &str) -> String {
         let mut out = String::with_capacity(s.len());
@@ -1162,6 +1193,20 @@ mod net {
                 now_unix,
                 agent: ureq::AgentBuilder::new().build(),
             }
+        }
+
+        #[test]
+        fn play_uris_body_has_full_uris_and_offset_position() {
+            let ids = vec![
+                "7hQJA50XrCWABAu5v6QZ4i".to_string(),
+                "22HMAUrbbYSj9NiPPlGumy".to_string(),
+            ];
+            let v: serde_json::Value = serde_json::from_str(&play_uris_body(&ids, 1)).unwrap();
+            let uris = v["uris"].as_array().unwrap();
+            assert_eq!(uris.len(), 2);
+            assert_eq!(uris[0], "spotify:track:7hQJA50XrCWABAu5v6QZ4i");
+            assert_eq!(uris[1], "spotify:track:22HMAUrbbYSj9NiPPlGumy");
+            assert_eq!(v["offset"]["position"], 1);
         }
 
         #[test]

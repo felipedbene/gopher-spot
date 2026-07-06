@@ -951,6 +951,9 @@ mod tests {
         fn play_context(&self, _c: &str, _o: u32) -> Result<(), ApiError> {
             Ok(())
         }
+        fn play_uris(&self, _ids: &[String], _offset: u32) -> Result<(), ApiError> {
+            Ok(())
+        }
         fn playlist_name(&self, id: &str) -> Result<String, ApiError> {
             Ok(format!("PL {id}"))
         }

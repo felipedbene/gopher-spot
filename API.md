@@ -1,6 +1,8 @@
 # gopher-spot machine API — v1 (`/spot/api/1`)
 
-The **machine API** is the contract the DeToca client consumes (from fio 9 on).
+The **machine API** is the contract the native clients — DeToca (Mac OS X 10.6),
+DeGelato (10.5/PowerPC), Casquinha (Mac OS 9) — consume (first shipped for
+DeToca's fio 9).
 It is deliberately separate from the human Gopher menus: the menus are PT-BR
 gophermaps for MacOS 9 clients (Netscape, Bombadillo, MacAST); this API is a
 stable, machine-parseable surface that never has to guess at a display string.
@@ -287,6 +289,45 @@ starting a playlist **context** works even where `/playlists/<id>` is `forbidden
 (playback resolves server-side and needs no track-read access). Poll `/spot/api/1/now`
 for the resulting state.
 
+### Play from a list (added 2026-07, for Casquinha)
+
+```
+/spot/api/1/play/from?ids=<id1>,<id2>,…,<idK>&offset=<n>
+```
+
+The native **"play from here onward"**: start playback of an explicit track
+list at index `offset`, in one call. The server hands Spotify the whole list
+(`PUT /v1/me/player/play` with a `uris` array + `offset.position`), so
+**Spotify owns the continuation**: auto-advance at each track end, `next`/`prev`
+move within the list. This is the v1 answer to jumping into a queue/playlist
+view — without it, a jump via the single-uri play path leaves a one-track
+context that **stops dead at the track's end** (librespot never pulls the
+server-side queue), forcing clients into chained skips or client-side
+sequencing, which this API rejects on principle.
+
+- `ids` — comma-joined **bare base62 track ids** (the 22-char tail of
+  `spotify:track:<id>`), `1 ≤ K ≤ 24`. Bare ids, not full uris: geomyidae's
+  request-line buffer caps selector length, and 24 bare ids stays comfortably
+  inside it. `K > 24` → `bad_range`.
+- `offset` — 0-based index into the list to start at; optional, default `0`.
+
+Returns the fresh **`/now`** snapshot (command convention) and busts the queue
+cache (like `next`/`prev`). Errors:
+
+- missing/empty `ids` → `bad_query`;
+- any id that isn't exactly 22 base62 chars (`[0-9A-Za-z]{22}`) → `bad_uri`;
+- `offset` ≥ K or non-numeric → `bad_range`;
+- otherwise the standard upstream mapping (`rate_limited`, `no_device`,
+  `upstream`).
+
+> **Why a new sub instead of `ids=` on `play`?** The server strips the query
+> when routing, so on an *old* server `play?ids=…` would silently match the
+> existing resume arm — a client could never feature-detect. As its own
+> selector (mirroring the `queue/add` naming), an old server answers
+> `not_found`, which is the client's clean signal to fall back (e.g. Casquinha
+> b41 → its b40 single-uri behavior). Additive, v1-legal per
+> [Versioning](#versioning).
+
 ### Cover (added in fio S2)
 
 ```
@@ -319,7 +360,8 @@ error	<short code>
 message	<english description>
 ```
 
-Codes: `bad_range`, `bad_uri`, `bad_query` (fio S3/4: empty search `q`),
+Codes: `bad_range`, `bad_uri`, `bad_query` (empty search `q`, or missing
+`play/from` ids),
 `no_track`, `no_device` (fio S3/3: `wake` found no registered gopher-spot
 device), `not_found`, `forbidden` (fio S3/5: Spotify blocks this app from reading
 the playlist — distinct from `not_found`; the playlist exists), `rate_limited`
@@ -351,8 +393,8 @@ Client-side rules for all of this — cadence, backoff, caching — live in
   interpolate the progress with `ts` (`estimated_position = position_ms +
   (now − ts)`) and a ≤3 s-stale snapshot is invisible. **Commands bust the
   cache**: after any `play`/`pause`/`next`/`prev`/`volume`/`seek`/`queue/add`/
-  `wake`, the next `/now` is fetched fresh, so a state change is never masked by
-  the cache. The TTL is a fixed constant (no configuration); errors are never
+  `wake`/`play/from`, the next `/now` is fetched fresh, so a state change is
+  never masked by the cache. The TTL is a fixed constant (no configuration); errors are never
   cached.
 - **Rate-limit degradation (fio 429).** When Spotify 429s the bridge, it stops
   calling Spotify for the `Retry-After` window. During that window `/now` serves
