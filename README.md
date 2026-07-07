@@ -179,7 +179,8 @@ classDiagram
     class api {
         <<module — machine API /spot/api/1>>
         now/play/pause/next/prev/volume/seek
-        queue, queue/add, play/from, cover(JPEG), wake, search
+        queue, queue/add, play/from, play/context, cover(JPEG), wake
+        search (tracks+artists+albums), artist/[id]/albums, album/[id]
         playlists, playlists/[id]
         ~3s /now micro-cache + 429 stale fallback
     }

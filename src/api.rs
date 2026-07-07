@@ -20,7 +20,10 @@
 //!     the client leaves with current state in one round-trip.
 
 use crate::dcgi::DcgiArgs;
-use crate::spotify::{Control, Playing, PlaylistsPage, SpotifyApi, Track, TracksPage};
+use crate::spotify::{
+    AlbumDetail, AlbumsPage, Control, Playing, PlaylistsPage, SearchResults, SpotifyApi, Track,
+    TracksPage,
+};
 use crate::stream::{StreamFacts, StreamSource};
 
 /// The contract version, emitted as the leading `api` key on every response.
@@ -73,6 +76,10 @@ pub fn route(
         // its own selector, old servers answer `not_found` — the client's clean
         // feature-detect signal (Casquinha falls back to its b40 behavior).
         "play/from" => play_from(api, args, now_ms),
+        // Play an album/artist/playlist as a CONTEXT (whole thing, in order,
+        // auto-advancing). Its own sub, like play/from: an old server answers
+        // not_found -> the client's feature-detect signal.
+        "play/context" => play_context_doc(api, args, now_ms),
         "pause" => command(api, now_ms, Control::Pause),
         "next" => command(api, now_ms, Control::Next),
         "prev" => command(api, now_ms, Control::Prev),
@@ -86,6 +93,14 @@ pub fn route(
         s if s.starts_with("playlists/") => {
             playlist_tracks_doc(api, args, &s["playlists/".len()..], now_ms)
         }
+        // An artist's discography: /spot/api/1/artist/<id>/albums (checked before
+        // the bare album/ arm so the /albums suffix wins).
+        s if s.starts_with("artist/") && s.ends_with("/albums") => {
+            let id = &s["artist/".len()..s.len() - "/albums".len()];
+            artist_albums_doc(api, args, id, now_ms)
+        }
+        // An album's header + tracks: /spot/api/1/album/<id>.
+        s if s.starts_with("album/") => album_doc(api, args, &s["album/".len()..], now_ms),
         other => error("not_found", &format!("unknown endpoint: {other}")),
     };
     text.into_bytes()
@@ -169,22 +184,49 @@ fn search_doc(api: &dyn SpotifyApi, args: &DcgiArgs, now_ms: i64) -> String {
         return error("bad_query", "search needs a non-empty q");
     }
     match api.search(q) {
-        Ok(r) => {
-            let tracks = r.tracks.as_ref().map(|p| p.items.as_slice()).unwrap_or(&[]);
-            search_snapshot(tracks, now_ms)
-        }
+        Ok(r) => search_snapshot(&r, now_ms),
         Err(e) => upstream(&e),
     }
 }
 
-/// The `/search` document: `result_len` then one indexed `item.<i>.*` block per
-/// track, in Spotify's relevance order. Same item shape as `/queue`.
-fn search_snapshot(tracks: &[Track], now_ms: i64) -> String {
+/// The `/search` document. Tracks lead, unchanged for old clients: `result_len`
+/// then one `item.<i>.*` block per track (same shape as `/queue`). Additive since
+/// this fio: `artist_len` + `artist.<i>.{id,name}` and `album_len` +
+/// `album.<i>.{id,name}` — the `search()` call already asks Spotify for
+/// `type=track,album,artist`, so this just stops discarding the other two kinds.
+/// An id-less ref (Spotify omitted the uri) is skipped: a client needs the id to
+/// open the artist's discography or play the album context.
+fn search_snapshot(r: &SearchResults, now_ms: i64) -> String {
+    let tracks = r.tracks.as_ref().map(|p| p.items.as_slice()).unwrap_or(&[]);
+    let artists = r
+        .artists
+        .as_ref()
+        .map(|p| p.items.as_slice())
+        .unwrap_or(&[]);
+    let albums = r.albums.as_ref().map(|p| p.items.as_slice()).unwrap_or(&[]);
     let mut out = String::new();
     kv(&mut out, "api", &API_VERSION.to_string());
     kv(&mut out, "result_len", &tracks.len().to_string());
     for (i, t) in tracks.iter().enumerate() {
         push_item(&mut out, i, t);
+    }
+    let artist_refs: Vec<(&str, &str)> = artists
+        .iter()
+        .filter_map(|a| crate::spotify::id_from_uri(&a.uri).map(|id| (id, a.name.as_str())))
+        .collect();
+    kv(&mut out, "artist_len", &artist_refs.len().to_string());
+    for (i, (id, name)) in artist_refs.iter().enumerate() {
+        kv(&mut out, &format!("artist.{i}.id"), id);
+        kv(&mut out, &format!("artist.{i}.name"), name);
+    }
+    let album_refs: Vec<(&str, &str)> = albums
+        .iter()
+        .filter_map(|a| crate::spotify::id_from_uri(&a.uri).map(|id| (id, a.name.as_str())))
+        .collect();
+    kv(&mut out, "album_len", &album_refs.len().to_string());
+    for (i, (id, name)) in album_refs.iter().enumerate() {
+        kv(&mut out, &format!("album.{i}.id"), id);
+        kv(&mut out, &format!("album.{i}.name"), name);
     }
     kv(&mut out, "ts", &now_ms.to_string());
     out
@@ -373,6 +415,139 @@ fn play_from(api: &dyn SpotifyApi, args: &DcgiArgs, now_ms: i64) -> String {
         }
         Err(e) => upstream(&e),
     }
+}
+
+/// A `spotify:{album|artist|playlist}:<base62>` uri — the kinds Spotify accepts
+/// as a play `context_uri`. `track` is excluded on purpose: a single track has no
+/// context (that's what `play/from` / `queue/add` are for). The id segment is
+/// gated by `valid_id` so nothing dotted can be interpolated upstream (GS-02).
+fn is_context_uri(uri: &str) -> bool {
+    let kind = match uri.strip_prefix("spotify:") {
+        Some(rest) => rest,
+        None => return false,
+    };
+    let (kind, id) = match kind.split_once(':') {
+        Some(kv) => kv,
+        None => return false,
+    };
+    matches!(kind, "album" | "artist" | "playlist") && crate::spotify::valid_id(id)
+}
+
+/// `/play/context?uri=<spotify:album|artist|playlist:id>&offset=<n>`: play a whole
+/// context in order — the native "queue this album". One upstream PUT hands
+/// Spotify the `context_uri`, so it owns the continuation (auto-advance, next/prev
+/// follow the album/playlist order) exactly like the human `?context_uri=` path.
+/// Non-context uri -> `bad_uri`; the settle waits for playback to actually land on
+/// the gopher-spot device (fio A2), so the reply never reads "playing elsewhere".
+fn play_context_doc(api: &dyn SpotifyApi, args: &DcgiArgs, now_ms: i64) -> String {
+    let uri = match args.query("uri") {
+        Some(u) if !u.trim().is_empty() => u.trim().to_string(),
+        _ => return error("bad_query", "play/context needs a non-empty uri"),
+    };
+    if !is_context_uri(&uri) {
+        return error(
+            "bad_uri",
+            "uri must be spotify:album:/artist:/playlist:<id>",
+        );
+    }
+    let offset = match args.query("offset") {
+        None => 0,
+        Some(s) => match s.trim().parse::<u32>() {
+            Ok(n) => n,
+            Err(_) => return error("bad_range", "offset must be a non-negative integer"),
+        },
+    };
+    match api.play_context(&uri, offset) {
+        Ok(()) => {
+            // A new context replaces the upcoming tracks — bust the cached queue,
+            // then settle on "playing on gopher-spot" (the first track of the
+            // context; its exact id is Spotify's to pick, so Intent::Play suffices).
+            api.invalidate_queue_cache();
+            settled_now(api, now_ms, &Intent::Play)
+        }
+        Err(e) if e.contains("no_device") => {
+            error("no_device", "gopher-spot device is not registered")
+        }
+        Err(e) => upstream(&e),
+    }
+}
+
+/// `/artist/<id>/albums`: an artist's discography as an indexed list
+/// (`item.<i>.{id,name}`), paginated via `?offset=`. `total`/`offset` let the
+/// client page. An album with no uri (hence no id) is skipped — a client needs the
+/// id to open or play it. Unknown/non-base62 id -> `not_found`.
+fn artist_albums_doc(api: &dyn SpotifyApi, args: &DcgiArgs, id: &str, now_ms: i64) -> String {
+    let id = id.trim_matches('/');
+    if !crate::spotify::valid_id(id) {
+        return error("not_found", "unknown artist");
+    }
+    let offset = args
+        .query("offset")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    match api.artist_albums(id, offset) {
+        Ok(p) => albums_snapshot(&p, now_ms),
+        Err(e) => upstream(&e),
+    }
+}
+
+fn albums_snapshot(p: &AlbumsPage, now_ms: i64) -> String {
+    let refs: Vec<(&str, &str)> = p
+        .items
+        .iter()
+        .filter_map(|a| crate::spotify::id_from_uri(&a.uri).map(|id| (id, a.name.as_str())))
+        .collect();
+    let mut out = String::new();
+    kv(&mut out, "api", &API_VERSION.to_string());
+    kv(&mut out, "result_len", &refs.len().to_string());
+    kv(&mut out, "total", &p.total.to_string());
+    kv(&mut out, "offset", &p.offset.to_string());
+    for (i, (id, name)) in refs.iter().enumerate() {
+        kv(&mut out, &format!("item.{i}.id"), id);
+        kv(&mut out, &format!("item.{i}.name"), name);
+    }
+    kv(&mut out, "ts", &now_ms.to_string());
+    out
+}
+
+/// `/album/<id>`: an album's `name`/`artist`/`total` header then its tracks in the
+/// `/search` list shape (`item.<i>.*`), paginated via `?offset=`. Lets a client
+/// show the track list before playing the whole thing via `/play/context`.
+/// Unknown/non-base62 id -> `not_found`.
+fn album_doc(api: &dyn SpotifyApi, args: &DcgiArgs, id: &str, now_ms: i64) -> String {
+    let id = id.trim_matches('/');
+    if !crate::spotify::valid_id(id) {
+        return error("not_found", "unknown album");
+    }
+    let offset = args
+        .query("offset")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    match (api.album(id), api.album_tracks(id, offset)) {
+        (Ok(al), Ok(t)) => album_snapshot(&al, &t, now_ms),
+        (Err(e), _) | (_, Err(e)) => upstream(&e),
+    }
+}
+
+fn album_snapshot(al: &AlbumDetail, t: &TracksPage, now_ms: i64) -> String {
+    let artist = al
+        .artists
+        .iter()
+        .map(|a| a.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut out = String::new();
+    kv(&mut out, "api", &API_VERSION.to_string());
+    kv(&mut out, "name", &al.name);
+    kv(&mut out, "artist", &artist);
+    kv(&mut out, "total", &al.total.to_string());
+    kv(&mut out, "result_len", &t.items.len().to_string());
+    kv(&mut out, "offset", &t.offset.to_string());
+    for (i, track) in t.items.iter().enumerate() {
+        push_item(&mut out, i, track);
+    }
+    kv(&mut out, "ts", &now_ms.to_string());
+    out
 }
 
 /// `/volume?<0-100>`: continuous. Out of range (or non-integer) -> `bad_range`.
@@ -870,6 +1045,8 @@ mod tests {
         last_queued: RefCell<Option<String>>,
         /// play/from: the (ids, offset) the endpoint handed to play_uris.
         last_play_from: RefCell<Option<(Vec<String>, u32)>>,
+        /// play/context: the (context_uri, offset) handed to play_context.
+        last_context: RefCell<Option<(String, u32)>>,
         // fio S3/2 micro-cache: count upstream now_playing fetches, and back the
         // cache with an in-memory (expiry_ms, doc) slot so a test can assert a
         // poll burst folds to one fetch and a command busts it.
@@ -902,6 +1079,7 @@ mod tests {
             last_seek: RefCell::new(None),
             last_queued: RefCell::new(None),
             last_play_from: RefCell::new(None),
+            last_context: RefCell::new(None),
             now_calls: RefCell::new(0),
             now_cache: RefCell::new(None),
             queue_calls: RefCell::new(0),
@@ -1012,8 +1190,25 @@ mod tests {
                 tracks: Some(Page {
                     items: vec![track(&format!("hit {q} A")), track(&format!("hit {q} B"))],
                 }),
-                artists: None,
-                albums: None,
+                artists: Some(Page {
+                    items: vec![
+                        Artist {
+                            name: "Chico Buarque".into(),
+                            uri: "spotify:artist:art1".into(),
+                        },
+                        // No uri -> no id -> must be filtered out of the doc.
+                        Artist {
+                            name: "sem uri".into(),
+                            uri: String::new(),
+                        },
+                    ],
+                }),
+                albums: Some(Page {
+                    items: vec![Album {
+                        name: "Construção".into(),
+                        uri: "spotify:album:al1".into(),
+                    }],
+                }),
             })
         }
         fn track(&self, _id: &str) -> Result<Track, ApiError> {
@@ -1029,7 +1224,16 @@ mod tests {
             *self.last_wake.borrow_mut() = Some(play);
             Ok(())
         }
-        fn play_context(&self, _c: &str, _o: u32) -> Result<(), ApiError> {
+        fn play_context(&self, c: &str, o: u32) -> Result<(), ApiError> {
+            // Same failure knobs as play_uris: no_device (like wake) and
+            // control_err (upstream/sentinel mapping).
+            if self.no_device {
+                return Err("no_device: 'gopher-spot' is not registered".into());
+            }
+            if let Some(e) = &self.control_err {
+                return Err(e.clone());
+            }
+            *self.last_context.borrow_mut() = Some((c.to_string(), o));
             Ok(())
         }
         fn play_uris(&self, ids: &[String], offset: u32) -> Result<(), ApiError> {
@@ -1085,16 +1289,52 @@ mod tests {
             }
         }
         fn album(&self, _id: &str) -> Result<AlbumDetail, ApiError> {
-            unimplemented!()
+            Ok(AlbumDetail {
+                name: "Construção".into(),
+                uri: "spotify:album:al1".into(),
+                artists: vec![
+                    Artist {
+                        name: "Chico Buarque".into(),
+                        uri: "spotify:artist:art1".into(),
+                    },
+                    Artist {
+                        name: "MPB4".into(),
+                        uri: "spotify:artist:art2".into(),
+                    },
+                ],
+                total: 11,
+            })
         }
-        fn album_tracks(&self, _id: &str, _o: u32) -> Result<TracksPage, ApiError> {
-            unimplemented!()
+        fn album_tracks(&self, _id: &str, offset: u32) -> Result<TracksPage, ApiError> {
+            Ok(TracksPage {
+                items: vec![track("Deus Lhe Pague"), track("Cotidiano")],
+                total: 11,
+                offset,
+            })
         }
         fn artist(&self, _id: &str) -> Result<Artist, ApiError> {
             unimplemented!()
         }
-        fn artist_albums(&self, _id: &str, _o: u32) -> Result<AlbumsPage, ApiError> {
-            unimplemented!()
+        fn artist_albums(&self, _id: &str, offset: u32) -> Result<AlbumsPage, ApiError> {
+            Ok(AlbumsPage {
+                items: vec![
+                    Album {
+                        name: "Construção".into(),
+                        uri: "spotify:album:al1".into(),
+                    },
+                    Album {
+                        name: "Chico 50 Anos".into(),
+                        uri: "spotify:album:al2".into(),
+                    },
+                    // No uri -> no id -> must be filtered out of the doc.
+                    Album {
+                        name: "sem uri".into(),
+                        uri: String::new(),
+                    },
+                ],
+                total: 30,
+                offset,
+            })
         }
         fn artist_top_tracks(&self, _id: &str) -> Result<Vec<Track>, ApiError> {
             unimplemented!()
@@ -2039,6 +2279,145 @@ mod tests {
         assert!(call(&f, "/spot/api/1/search").contains("error\tbad_query\r\n"));
         // whitespace-only decodes to empty after trim
         assert!(call(&f, "/spot/api/1/search?q=%20%20").contains("error\tbad_query\r\n"));
+    }
+
+    // ---- album-context feature: artists+albums in search, discography, play ----
+
+    #[test]
+    fn search_surfaces_artists_and_albums() {
+        let f = fake(playing_track());
+        let out = call(&f, "/spot/api/1/search?q=chico");
+        assert_wire(&out);
+        // Tracks unchanged (old clients keep working).
+        assert!(out.contains("result_len\t2\r\n"));
+        assert!(out.contains("item.0.track\thit chico A\r\n"));
+        // Artists: the id-less one is filtered, so 1 of 2.
+        assert!(out.contains("artist_len\t1\r\n"), "{out}");
+        assert!(out.contains("artist.0.id\tart1\r\n"), "{out}");
+        assert!(out.contains("artist.0.name\tChico Buarque\r\n"), "{out}");
+        assert!(
+            !out.contains("sem uri"),
+            "id-less ref must be dropped: {out}"
+        );
+        // Albums.
+        assert!(out.contains("album_len\t1\r\n"), "{out}");
+        assert!(out.contains("album.0.id\tal1\r\n"), "{out}");
+        assert!(out.contains("album.0.name\tConstrução\r\n"), "{out}");
+    }
+
+    #[test]
+    fn artist_albums_lists_the_discography_with_ids() {
+        let f = fake(playing_track());
+        let out = call(&f, "/spot/api/1/artist/art1/albums");
+        assert_wire(&out);
+        assert!(out.contains("result_len\t2\r\n"), "id-less filtered: {out}");
+        assert!(out.contains("total\t30\r\n"));
+        assert!(out.contains("offset\t0\r\n"));
+        assert!(out.contains("item.0.id\tal1\r\n"));
+        assert!(out.contains("item.0.name\tConstrução\r\n"));
+        assert!(out.contains("item.1.id\tal2\r\n"));
+        assert!(!out.contains("sem uri"), "{out}");
+    }
+
+    #[test]
+    fn artist_albums_paginates_via_offset() {
+        let f = fake(playing_track());
+        let out = call(&f, "/spot/api/1/artist/art1/albums?offset=20");
+        assert!(out.contains("offset\t20\r\n"), "{out}");
+    }
+
+    #[test]
+    fn artist_albums_rejects_a_non_base62_id() {
+        let f = fake(playing_track());
+        // The /albums suffix still routes here; the id gate rejects it.
+        let out = call(&f, "/spot/api/1/artist/..%2Fme/albums");
+        assert!(out.contains("error\tnot_found\r\n"), "{out}");
+    }
+
+    #[test]
+    fn album_lists_header_and_tracks() {
+        let f = fake(playing_track());
+        let out = call(&f, "/spot/api/1/album/al1");
+        assert_wire(&out);
+        assert!(out.contains("name\tConstrução\r\n"));
+        assert!(out.contains("artist\tChico Buarque, MPB4\r\n"));
+        assert!(out.contains("total\t11\r\n"));
+        assert!(out.contains("result_len\t2\r\n"));
+        assert!(out.contains("item.0.track\tDeus Lhe Pague\r\n"));
+        assert!(out.contains("item.1.track\tCotidiano\r\n"));
+    }
+
+    #[test]
+    fn album_rejects_a_non_base62_id() {
+        let f = fake(playing_track());
+        let out = call(&f, "/spot/api/1/album/..%2Fme");
+        assert!(out.contains("error\tnot_found\r\n"), "{out}");
+    }
+
+    #[test]
+    fn play_context_plays_the_album_and_settles() {
+        let f = fake(playing_track());
+        let out = call(
+            &f,
+            "/spot/api/1/play/context?uri=spotify:album:al1&offset=0",
+        );
+        // The endpoint handed Spotify the album context...
+        assert_eq!(
+            *f.last_context.borrow(),
+            Some(("spotify:album:al1".to_string(), 0))
+        );
+        // ...and replied with a settled /now (device active, playing) — never a lie.
+        assert!(out.contains("state\tplaying\r\n"), "{out}");
+        assert!(out.contains("device\tactive\r\n"), "{out}");
+        // A new context invalidates the cached queue.
+        assert!(*f.queue_busts.borrow() >= 1, "queue cache must be busted");
+    }
+
+    #[test]
+    fn play_context_defaults_offset_to_zero() {
+        let f = fake(playing_track());
+        call(&f, "/spot/api/1/play/context?uri=spotify:artist:art1");
+        assert_eq!(f.last_context.borrow().as_ref().unwrap().1, 0);
+    }
+
+    #[test]
+    fn play_context_rejects_bad_or_missing_uri() {
+        let f = fake(playing_track());
+        // A single track is not a context.
+        assert!(
+            call(&f, "/spot/api/1/play/context?uri=spotify:track:abc123")
+                .contains("error\tbad_uri\r\n")
+        );
+        // Garbage / dotted id in the uri.
+        assert!(
+            call(&f, "/spot/api/1/play/context?uri=spotify:album:..%2Fme")
+                .contains("error\tbad_uri\r\n")
+        );
+        assert!(call(&f, "/spot/api/1/play/context?uri=nonsense").contains("error\tbad_uri\r\n"));
+        // Missing uri.
+        assert!(call(&f, "/spot/api/1/play/context").contains("error\tbad_query\r\n"));
+        // Nothing reached the upstream.
+        assert!(f.last_context.borrow().is_none());
+    }
+
+    #[test]
+    fn play_context_no_device_is_no_device_error() {
+        let f = Fake {
+            no_device: true,
+            ..fake(playing_track())
+        };
+        let out = call(&f, "/spot/api/1/play/context?uri=spotify:album:al1");
+        assert!(out.contains("error\tno_device\r\n"), "{out}");
+    }
+
+    #[test]
+    fn play_context_upstream_failure_maps_via_sentinel() {
+        let f = Fake {
+            control_err: Some(format!("{} spotify cooldown", crate::spotify::RATE_LIMITED)),
+            ..fake(playing_track())
+        };
+        let out = call(&f, "/spot/api/1/play/context?uri=spotify:album:al1");
+        assert!(out.contains("error\trate_limited\r\n"), "{out}");
     }
 
     // ---- fio S3/5: playlists --------------------------------------------------

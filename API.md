@@ -239,29 +239,109 @@ skips.
 /spot/api/1/search?q=<urlencoded query>
 ```
 
-Track search. Returns a v1 **list** (same `item.<i>.*` shape as `/queue`), with
-`result_len` as the count header:
+Search across **tracks, artists, and albums**. Tracks lead as a v1 **list** (same
+`item.<i>.*` shape as `/queue`), with `result_len` as the count header; artists
+and albums follow in their own additive blocks:
 
 | key                    | when     | value                                    |
 |------------------------|----------|------------------------------------------|
 | `api`                  | always   | `1`                                      |
-| `result_len`           | always   | number of tracks (`0` if none)           |
-| `item.<i>.uri`         | per item | `spotify:track:<id>`                     |
-| `item.<i>.track`       | per item | track name                               |
-| `item.<i>.artist`      | per item | artist name(s), joined with `, `         |
-| `item.<i>.album_id`    | album    | Spotify album id (for `/cover`)          |
-| `item.<i>.duration_ms` | per item | track length (int, ms)                   |
+| `result_len`           | always   | number of **tracks** (`0` if none)       |
+| `item.<i>.uri`         | per track | `spotify:track:<id>`                     |
+| `item.<i>.track`       | per track | track name                               |
+| `item.<i>.artist`      | per track | artist name(s), joined with `, `         |
+| `item.<i>.album_id`    | album known | Spotify album id (for `/cover`)        |
+| `item.<i>.duration_ms` | per track | track length (int, ms)                   |
+| `artist_len`           | always   | number of artist results                 |
+| `artist.<i>.id`        | per artist | Spotify artist id (feed `/artist/<id>/albums`) |
+| `artist.<i>.name`      | per artist | artist name                            |
+| `album_len`            | always   | number of album results                  |
+| `album.<i>.id`         | per album | Spotify album id (feed `/album/<id>` or `/play/context`) |
+| `album.<i>.name`       | per album | album name                             |
 | `ts`                   | always   | unix epoch **ms** at snapshot time        |
 
 - `q` is the **urlencoded** query; UTF-8 is decoded correctly, so
   `search?q=constru%C3%A7%C3%A3o` searches for `construção`.
 - Empty or absent `q` (including whitespace-only) → `bad_query`.
-- **Tracks only** for now (`type=track`), and **capped at 10** results:
-  Spotify's `/v1/search` **400s `limit>10`** ("Invalid limit") — verified
-  empirically (`limit=20` and `limit=50` both 400, `limit=10` works). So although
-  the client should read `result_len`, it will not exceed 10 in v1. (The PROMPT's
-  "limit 20" was dropped for this hard Spotify constraint; a client must not
-  assume a fixed count.)
+- The `artist_len` / `album_len` blocks are **additive** (added this fio): the
+  `search()` call always asked Spotify for `type=track,album,artist`, so surfacing
+  artists/albums costs no extra upstream call. Old clients that read only
+  `result_len` + `item.*` are unaffected. An artist/album whose uri Spotify omitted
+  is dropped (a client needs the id to drill in), so `artist_len` can be less than
+  the raw hit count.
+- Each kind is **capped at 10** results: Spotify's `/v1/search` **400s `limit>10`**
+  ("Invalid limit") — verified empirically (`limit=20`/`50` both 400, `10` works).
+  A client must read the `*_len` headers and not assume a fixed count.
+
+### Artist discography (added for album-context)
+
+```
+/spot/api/1/artist/<id>/albums
+/spot/api/1/artist/<id>/albums?offset=<n>
+```
+
+An artist's albums as an indexed list, paginated via `?offset=` (20/page). Feed a
+`<id>` from a `search` `artist.<i>.id`.
+
+| key             | when     | value                                    |
+|-----------------|----------|------------------------------------------|
+| `api`           | always   | `1`                                      |
+| `result_len`    | always   | albums in this response                  |
+| `total`         | always   | grand total (for paging)                 |
+| `offset`        | always   | this page's offset                       |
+| `item.<i>.id`   | per item | Spotify album id (for `/album`/`/play/context`) |
+| `item.<i>.name` | per item | album name                               |
+| `ts`            | always   | unix epoch **ms**                        |
+
+Unknown or non-base62 `<id>` → `not_found`. An album with no uri (hence no id) is
+dropped, so `result_len` can be less than the raw page size.
+
+### Album detail (added for album-context)
+
+```
+/spot/api/1/album/<id>
+/spot/api/1/album/<id>?offset=<n>
+```
+
+An album's header then its tracks in the **`/search` list shape**, paginated via
+`?offset=` — lets a client show the track list before playing the whole thing.
+
+| key           | when   | value                                       |
+|---------------|--------|---------------------------------------------|
+| `api`         | always | `1`                                         |
+| `name`        | always | album name                                  |
+| `artist`      | always | album artist(s), joined with `, `           |
+| `total`       | always | total tracks on the album                   |
+| `result_len`  | always | tracks in this response                     |
+| `offset`      | always | this page's offset                          |
+| `item.<i>.*`  | per item | same track block as `/search` / `/queue`  |
+| `ts`          | always | unix epoch **ms**                           |
+
+Unknown or non-base62 `<id>` → `not_found`.
+
+### Playing a context / whole album (added for album-context)
+
+```
+/spot/api/1/play/context?uri=<spotify:album|artist|playlist:id>&offset=<n>
+```
+
+Play a whole **context** in order — the machine-API "queue this album". One
+upstream `PUT` hands Spotify the `context_uri`, so **Spotify owns the
+continuation**: it auto-advances track→track and `next`/`prev` follow the album
+order (unlike `play/from`, which needs the explicit track ids). `offset` (default
+`0`) is the 0-based start track within the context. Replies with a **settled**
+`/now` snapshot (fio A2): the reply waits for playback to actually land on the
+gopher-spot device, so it never reads `device idle` / "playing elsewhere".
+
+- `uri` must be `spotify:album:`, `spotify:artist:`, or `spotify:playlist:` +
+  base62 id. A `spotify:track:` uri (no context) or malformed uri → `bad_uri`;
+  missing/empty `uri` → `bad_query`; non-integer `offset` → `bad_range`.
+- gopher-spot device not registered (librespot down) → `no_device`.
+- A **new** sub, like `play/from`: an old server answers `not_found`, which is the
+  client's clean feature-detect signal.
+- **Playlists are still dev-mode blocked** for track reads, but playing a playlist
+  *context* works (same as the human `?context_uri=` path). Albums and artists are
+  the reliable cases.
 
 ### Playlists (added in fio S3/5)
 

@@ -113,6 +113,25 @@ this document is only about *how to consume it well*.
     `not_found`; on that, stop asking for the rest of the run and fall back to
     your receive-side heuristic. Don't retry-loop it (rule 8 applies).
 
+## Artists & albums (whole-album play)
+
+25. **Search returns three kinds now** — read `result_len` (tracks) **and**
+    `artist_len` / `album_len`. The artist/album blocks are additive; an old
+    client that reads only `item.*` still works, but to offer "browse this
+    artist" or "play this album" you need `artist.<i>.id` / `album.<i>.id`.
+26. **Drill artist → albums via `/artist/<id>/albums`**, paginated by `?offset=`
+    (20/page); read `total` to page. Don't try to reconstruct a discography from
+    search — search caps each kind at 10.
+27. **Play a whole album with ONE `play/context`, never a queue-add loop.**
+    `play/context?uri=spotify:album:<id>` hands Spotify the context and it owns
+    the continuation (auto-advance, in-order `next`/`prev`). Enqueuing an album
+    track-by-track is N eventually-consistent calls and courts a 429 — don't.
+    `offset` picks the start track. Feature-detect like `play/from`: an old
+    server answers `not_found`.
+28. **`play/context` is a command** — it returns a settled `/now` (rule 21), so
+    render its reply and don't poll for ~1 s after. Artist and album contexts are
+    reliable; a playlist context may `forbidden` under the dev-mode block.
+
 ## Spot-check checklist
 
 Watch one client session (server logs + a packet trace or client debug log) and
@@ -134,6 +153,7 @@ tick these off:
 | 12 | Errors | client switches on `error` code; `message` text nowhere in client logic |
 | 13 | List jump | one `play/from` per jump; no `/next` chains; no end-of-track watchdog issuing plays |
 | 14 | `/stream` | cadence ≥ the `/now` cadence; one feature-detect per launch; "waiting" UI only when `live` `0` ∧ `playing` ∧ `active` |
+| 15 | Album play | one `play/context` per album; NO per-track `queue/add` loop; reply rendered without an immediate `/now` poll |
 
 A quick server-side way to observe a client's request pattern (geomyidae logs
 every selector):
