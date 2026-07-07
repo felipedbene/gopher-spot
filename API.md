@@ -233,6 +233,33 @@ from or clear the queue (only add). It is deliberately absent from v1; if Spotif
 ever adds one it can be added additively. We do **not** emulate it with chained
 skips.
 
+```
+/spot/api/1/queue/album?id=<album_id>
+```
+
+Enqueue a whole **album** onto up-next (added for album-context). Spotify's queue
+endpoint takes one track uri at a time — there is no context enqueue — so the
+server expands the album into a bounded run of per-track adds and returns the
+fresh **`/queue`** snapshot, same as `queue/add`. Non-destructive: unlike
+`play/context` (which replaces the queue and starts the album *now*), this
+**appends** without interrupting the current track.
+
+- Capped at **24 tracks** per call (bounds the burst inside geomyidae's request
+  budget; covers essentially every single album — a longer compilation is
+  truncated, best-effort).
+- **Best-effort:** a rate-limit (or upstream error) partway through stops the run
+  and returns what landed; if *nothing* landed it surfaces as `rate_limited` /
+  `upstream`. Eventually consistent like `queue/add` — the client re-polls
+  `/queue`.
+- Non-base62 id → `not_found`; an album with no playable tracks → `not_found`.
+- A new sub: an old server answers `not_found` (feature-detect).
+
+> **No `queue/clear`.** Emulating it was investigated and abandoned: the public
+> Web API can't remove queued items, and the workarounds don't survive Spotify's
+> no-op coalescing — replaying the current track *or* its context (both verified
+> live) leaves the queue intact. Only Spotify's private backend can clear, which
+> third-party apps can't reach.
+
 ### Search (added in fio S3/4)
 
 ```

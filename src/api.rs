@@ -87,6 +87,9 @@ pub fn route(
         "seek" => seek(api, args, now_ms),
         "queue" => queue_doc(api, now_ms),
         "queue/add" => queue_add(api, args, now_ms),
+        // Enqueue a whole album's tracks (Spotify's queue takes one at a time, so
+        // this is the server-side expansion the client can't express in one call).
+        "queue/album" => queue_album_doc(api, args, now_ms),
         "wake" => wake(api, args, now_ms),
         "search" => search_doc(api, args, now_ms),
         "playlists" => playlists_doc(api, args, now_ms),
@@ -170,6 +173,76 @@ fn queue_add(api: &dyn SpotifyApi, args: &DcgiArgs, now_ms: i64) -> String {
         }
         Err(e) => upstream(&e),
     }
+}
+
+/// Cap on tracks enqueued by one `queue/album`. Bounds the burst of `queue/add`
+/// POSTs (one per track) so the request stays inside geomyidae's ~10 s budget and
+/// doesn't hammer the rate-limited player endpoint. Covers essentially every
+/// single album; a longer compilation is truncated (best-effort).
+const QUEUE_ALBUM_MAX: usize = 24;
+
+/// `/queue/album?id=<album_id>`: enqueue an album's tracks onto up-next. Spotify's
+/// queue endpoint takes ONE track uri at a time (no context enqueue), so this
+/// expands the album server-side into a bounded run of `queue/add` POSTs — the
+/// "add a whole album" a client can't express as a single call, without playing
+/// it now (that's `play/context`). Best-effort: a rate-limit (or upstream error)
+/// mid-run stops early and returns whatever landed; if nothing landed, the error
+/// surfaces. Returns the fresh `/queue` snapshot like `queue/add`. Non-base62 id
+/// -> `not_found`; an album with no playable tracks -> `not_found`.
+fn queue_album_doc(api: &dyn SpotifyApi, args: &DcgiArgs, now_ms: i64) -> String {
+    let id = match args.query("id") {
+        Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+        _ => return error("bad_query", "queue/album needs an id"),
+    };
+    if !crate::spotify::valid_id(&id) {
+        return error("not_found", "unknown album");
+    }
+    // Collect up to QUEUE_ALBUM_MAX track uris, paging the album if needed.
+    let mut uris: Vec<String> = Vec::new();
+    let mut offset = 0u32;
+    while uris.len() < QUEUE_ALBUM_MAX {
+        let page = match api.album_tracks(&id, offset) {
+            Ok(p) => p,
+            Err(e) => return upstream(&e),
+        };
+        if page.items.is_empty() {
+            break;
+        }
+        for t in &page.items {
+            if uris.len() >= QUEUE_ALBUM_MAX {
+                break;
+            }
+            if is_track_uri(&t.uri) {
+                uris.push(t.uri.clone());
+            }
+        }
+        offset += page.items.len() as u32;
+        if offset as usize >= page.total as usize {
+            break;
+        }
+    }
+    if uris.is_empty() {
+        return error("not_found", "album has no playable tracks");
+    }
+    let mut added = 0usize;
+    for uri in &uris {
+        match api.queue_add(uri) {
+            Ok(()) => added += 1,
+            // Any enqueue failure ends the run. A rate-limit must never be
+            // amplified; other errors won't heal within the request. If NOTHING
+            // landed, surface it (mapping the rate_limited sentinel); otherwise
+            // the partial add is a success — return the queue.
+            Err(e) => {
+                if added == 0 {
+                    return upstream(&e);
+                }
+                break;
+            }
+        }
+    }
+    api.invalidate_queue_cache();
+    api.invalidate_now_cache();
+    queue_doc(api, now_ms)
 }
 
 /// `/search?q=<urlencoded>`: track results as a v1 list (same `item.<i>.*` shape
@@ -1043,6 +1116,9 @@ mod tests {
         last: RefCell<Option<Control>>,
         last_seek: RefCell<Option<u64>>,
         last_queued: RefCell<Option<String>>,
+        /// Every uri handed to queue_add, in order — lets queue/album assert the
+        /// per-track enqueue count.
+        queued: RefCell<Vec<String>>,
         /// play/from: the (ids, offset) the endpoint handed to play_uris.
         last_play_from: RefCell<Option<(Vec<String>, u32)>>,
         /// play/context: the (context_uri, offset) handed to play_context.
@@ -1078,6 +1154,7 @@ mod tests {
             last: RefCell::new(None),
             last_seek: RefCell::new(None),
             last_queued: RefCell::new(None),
+            queued: RefCell::new(Vec::new()),
             last_play_from: RefCell::new(None),
             last_context: RefCell::new(None),
             now_calls: RefCell::new(0),
@@ -1160,7 +1237,13 @@ mod tests {
             *self.queue_busts.borrow_mut() += 1;
         }
         fn queue_add(&self, uri: &str) -> Result<(), ApiError> {
+            // control_err lets a test arm a rate-limit (or other upstream error)
+            // on the enqueue — how queue/album's mid-loop abort is exercised.
+            if let Some(e) = &self.control_err {
+                return Err(e.clone());
+            }
             *self.last_queued.borrow_mut() = Some(uri.to_string());
+            self.queued.borrow_mut().push(uri.to_string());
             Ok(())
         }
         fn album_cover(&self, album_id: &str, want_px: u32) -> Result<Vec<u8>, ApiError> {
@@ -1306,9 +1389,16 @@ mod tests {
             })
         }
         fn album_tracks(&self, _id: &str, offset: u32) -> Result<TracksPage, ApiError> {
+            // Paginate honestly: two tracks on page 0, empty after — so a pager
+            // (queue/album) terminates instead of looping on a fixed page.
+            let items = if offset == 0 {
+                vec![track("Deus Lhe Pague"), track("Cotidiano")]
+            } else {
+                Vec::new()
+            };
             Ok(TracksPage {
-                items: vec![track("Deus Lhe Pague"), track("Cotidiano")],
-                total: 11,
+                items,
+                total: 2,
                 offset,
             })
         }
@@ -1677,6 +1767,41 @@ mod tests {
         assert!(call(&f, "/spot/api/1/queue/add?spotify:track:").contains("error\tbad_uri\r\n"));
         // A valid track uri must NOT be rejected.
         assert!(!call(&f, "/spot/api/1/queue/add?spotify:track:ok").contains("error\t"));
+    }
+
+    #[test]
+    fn queue_album_enqueues_every_track_and_returns_queue() {
+        let f = fake(playing_track());
+        let out = call(&f, "/spot/api/1/queue/album?id=al1");
+        // The fake album has two tracks — both enqueued.
+        assert_eq!(f.queued.borrow().len(), 2, "both album tracks enqueued");
+        // Caches busted and the fresh /queue snapshot returned (not /now).
+        assert!(*f.queue_busts.borrow() >= 1, "queue cache busted");
+        assert!(out.contains("queue_len\t2\r\n"), "{out}");
+        assert!(!out.contains("state\t"), "returns /queue, not /now");
+    }
+
+    #[test]
+    fn queue_album_bad_or_missing_id() {
+        let f = fake(playing_track());
+        assert!(call(&f, "/spot/api/1/queue/album").contains("error\tbad_query\r\n"));
+        assert!(call(&f, "/spot/api/1/queue/album?id=").contains("error\tbad_query\r\n"));
+        // Non-base62 id must not reach the upstream path (GS-02).
+        assert!(call(&f, "/spot/api/1/queue/album?id=..%2Fme").contains("error\tnot_found\r\n"));
+        assert!(f.queued.borrow().is_empty());
+    }
+
+    #[test]
+    fn queue_album_rate_limited_before_any_add_surfaces_the_error() {
+        // A cooldown armed before the first enqueue: nothing landed, so the
+        // rate_limited sentinel surfaces (mapped by upstream()).
+        let f = Fake {
+            control_err: Some(format!("{} spotify cooldown", crate::spotify::RATE_LIMITED)),
+            ..fake(playing_track())
+        };
+        let out = call(&f, "/spot/api/1/queue/album?id=al1");
+        assert!(out.contains("error\trate_limited\r\n"), "{out}");
+        assert!(f.queued.borrow().is_empty());
     }
 
     // ---- fio S2: cover --------------------------------------------------------

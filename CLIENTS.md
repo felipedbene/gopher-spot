@@ -122,12 +122,15 @@ this document is only about *how to consume it well*.
 26. **Drill artist → albums via `/artist/<id>/albums`**, paginated by `?offset=`
     (20/page); read `total` to page. Don't try to reconstruct a discography from
     search — search caps each kind at 10.
-27. **Play a whole album with ONE `play/context`, never a queue-add loop.**
+27. **Play a whole album with ONE `play/context`; append one with ONE
+    `queue/album`.** To play the album NOW (replace the queue, start it),
     `play/context?uri=spotify:album:<id>` hands Spotify the context and it owns
-    the continuation (auto-advance, in-order `next`/`prev`). Enqueuing an album
-    track-by-track is N eventually-consistent calls and courts a 429 — don't.
-    `offset` picks the start track. Feature-detect like `play/from`: an old
-    server answers `not_found`.
+    the continuation (auto-advance, in-order `next`/`prev`); `offset` picks the
+    start track. To APPEND the album to up-next without interrupting, use
+    `queue/album?id=<id>` — the server does the per-track expansion (Spotify's
+    queue takes one uri at a time), so the **client must never loop `queue/add`
+    itself** (N calls, courts a 429). Both feature-detect like `play/from` (old
+    server → `not_found`).
 28. **`play/context` is a command** — it returns a settled `/now` (rule 21), so
     render its reply and don't poll for ~1 s after. Artist and album contexts are
     reliable; a playlist context may `forbidden` under the dev-mode block.
