@@ -569,30 +569,39 @@ pub enum Intent {
 /// time since the command (attempt × interval), which widens the seek window
 /// as playback advances under us.
 pub fn settled(intent: &Intent, snap: &Playing, elapsed_ms: u64) -> bool {
+    // Every machine-API command targets the gopher-spot librespot device, so a
+    // reply is only "settled" once the snapshot also agrees the ACTIVE device is
+    // gopher-spot. Spotify's `/v1/me/player` is eventually consistent on the
+    // device field, not just playback: the first post-command poll can show the
+    // track/state already flipped while `device` still names the previous player.
+    // That snapshot renders `device idle` → the client shows "playing elsewhere"
+    // for a track gopher-spot is in fact producing. `wake` always required this;
+    // extend it to the other playing intents (fio A2 follow-up). The stopped/None
+    // escapes stay ungated — a genuinely stopped player reports no device (204),
+    // which is itself a valid settle.
+    let gs_active = matches!(&snap.device, Some(d) if d.name == "gopher-spot");
     match intent {
-        Intent::Play => snap.is_playing && snap.item.is_some(),
-        Intent::Pause => !snap.is_playing && snap.item.is_some(),
+        Intent::Play => gs_active && snap.is_playing && snap.item.is_some(),
+        Intent::Pause => gs_active && !snap.is_playing && snap.item.is_some(),
         Intent::Skip { pre_track_id: None } => true,
         Intent::Skip {
             pre_track_id: Some(pre),
         } => match &snap.item {
             // Skipping past the end of the queue legitimately stops playback.
             None => true,
-            Some(t) => t.id.as_deref() != Some(pre.as_str()),
+            Some(t) => gs_active && t.id.as_deref() != Some(pre.as_str()),
         },
         Intent::Volume(v) => {
-            matches!(&snap.device, Some(d) if d.volume_percent == Some(*v as u32))
+            matches!(&snap.device, Some(d) if d.name == "gopher-spot" && d.volume_percent == Some(*v as u32))
         }
         Intent::Seek { target_ms } => {
-            snap.progress_ms >= *target_ms
+            gs_active
+                && snap.progress_ms >= *target_ms
                 && snap.progress_ms <= target_ms + elapsed_ms + SETTLE_SEEK_SLACK_MS
         }
-        Intent::Wake { play } => {
-            let active = matches!(&snap.device, Some(d) if d.name == "gopher-spot");
-            active && (!play || snap.is_playing)
-        }
+        Intent::Wake { play } => gs_active && (!play || snap.is_playing),
         Intent::PlayFrom { track_id } => {
-            matches!(&snap.item, Some(t) if t.id.as_deref() == Some(track_id.as_str()))
+            gs_active && matches!(&snap.item, Some(t) if t.id.as_deref() == Some(track_id.as_str()))
         }
     }
 }
@@ -1754,6 +1763,62 @@ mod tests {
         assert!(settled(&want, &with_track_id(playing_track(), "zzz999"), 0));
         assert!(!settled(&want, &playing_track(), 0)); // still the old track
         assert!(!settled(&want, &stopped(), 0));
+    }
+
+    #[test]
+    fn settle_requires_gopher_spot_active_not_a_transient_other_device() {
+        // The "playing elsewhere" lie (fio A2 follow-up): Spotify's device field
+        // lags the playback flip, so the first post-command poll can show the new
+        // state on the PHONE. That must NOT settle — returning it renders `device
+        // idle` and the client says "playing elsewhere" for a local track.
+        let phone_new = with_device(with_track_id(playing_track(), "zzz999"), "iPhone", Some(40));
+        let ours_new = with_track_id(playing_track(), "zzz999"); // gopher-spot active
+
+        let skip = Intent::Skip {
+            pre_track_id: Some("abc123".into()),
+        };
+        assert!(
+            !settled(&skip, &phone_new, 0),
+            "track flipped but on the phone"
+        );
+        assert!(settled(&skip, &ours_new, 0), "flipped on gopher-spot");
+
+        assert!(!settled(
+            &Intent::Play,
+            &with_device(playing_track(), "iPhone", Some(40)),
+            0
+        ));
+        assert!(settled(&Intent::Play, &playing_track(), 0));
+
+        let from = Intent::PlayFrom {
+            track_id: "zzz999".into(),
+        };
+        assert!(!settled(&from, &phone_new, 0));
+        assert!(settled(&from, &ours_new, 0));
+
+        let seek = Intent::Seek { target_ms: 42_000 };
+        assert!(!settled(
+            &seek,
+            &with_device(playing_track(), "iPhone", Some(40)),
+            0
+        ));
+        assert!(settled(&seek, &playing_track(), 0));
+    }
+
+    #[test]
+    fn play_settles_only_once_the_device_lands_on_gopher_spot() {
+        // End-to-end guard for the "playing elsewhere" report: the command lands,
+        // but the first poll still names the phone. The settle keeps polling until
+        // gopher-spot is the active device, so the reply is `device active`.
+        let f = fake(playing_track());
+        *f.now_seq.borrow_mut() = vec![
+            Ok(with_device(playing_track(), "iPhone", Some(40))), // device field lags
+            Ok(playing_track()),                                  // gopher-spot active
+        ];
+        let out = call(&f, "/spot/api/1/play");
+        assert!(out.contains("device\tactive\r\n"), "must not lie: {out}");
+        assert!(!out.contains("device\tidle\r\n"), "{out}");
+        assert_eq!(*f.now_calls.borrow(), 2, "polled past the lagging device");
     }
 
     #[test]
