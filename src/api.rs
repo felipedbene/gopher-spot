@@ -363,7 +363,10 @@ fn play_from(api: &dyn SpotifyApi, args: &DcgiArgs, now_ms: i64) -> String {
             // Jumping into a list replaces the upcoming tracks, so the cached
             // queue is stale — same bust next/prev pay.
             api.invalidate_queue_cache();
-            fresh_now(api, now_ms)
+            let intent = Intent::PlayFrom {
+                track_id: ids[offset as usize].clone(),
+            };
+            settled_now(api, now_ms, &intent)
         }
         Err(e) if e.contains("no_device") => {
             error("no_device", "gopher-spot device is not registered")
@@ -376,7 +379,7 @@ fn play_from(api: &dyn SpotifyApi, args: &DcgiArgs, now_ms: i64) -> String {
 fn volume(api: &dyn SpotifyApi, args: &DcgiArgs, now_ms: i64) -> String {
     match args.raw_arg().trim().parse::<i64>() {
         Ok(v) if (0..=100).contains(&v) => match api.control(Control::Volume(v as u8)) {
-            Ok(()) => fresh_now(api, now_ms),
+            Ok(()) => settled_now(api, now_ms, &Intent::Volume(v as u8)),
             Err(e) => upstream(&e),
         },
         _ => error("bad_range", "volume must be an integer 0-100"),
@@ -403,8 +406,9 @@ fn seek(api: &dyn SpotifyApi, args: &DcgiArgs, now_ms: i64) -> String {
         Some(d) if d > 0 => d,
         _ => return error("no_track", "nothing playing to seek"),
     };
-    match api.seek(pos.min(duration)) {
-        Ok(()) => fresh_now(api, now_ms),
+    let target_ms = pos.min(duration);
+    match api.seek(target_ms) {
+        Ok(()) => settled_now(api, now_ms, &Intent::Seek { target_ms }),
         Err(e) => upstream(&e),
     }
 }
@@ -417,9 +421,10 @@ fn seek(api: &dyn SpotifyApi, args: &DcgiArgs, now_ms: i64) -> String {
 fn wake(api: &dyn SpotifyApi, args: &DcgiArgs, now_ms: i64) -> String {
     let play = args.query("play").as_deref() == Some("1");
     match api.wake(play) {
-        // wake is a command: fresh_now busts the micro-cache so the transfer is
-        // reflected immediately (fio S3/2 synergy).
-        Ok(()) => fresh_now(api, now_ms),
+        // wake is a command: the settled reply busts the micro-cache so the
+        // transfer is reflected immediately (fio S3/2 synergy), and the settle
+        // waits for `device active` to actually land (fio A2).
+        Ok(()) => settled_now(api, now_ms, &Intent::Wake { play }),
         Err(e) if e.contains("no_device") => {
             error("no_device", "gopher-spot device is not registered")
         }
@@ -427,13 +432,24 @@ fn wake(api: &dyn SpotifyApi, args: &DcgiArgs, now_ms: i64) -> String {
     }
 }
 
-/// Run a play/pause/next/prev command, then reply with a fresh snapshot. For the
-/// idempotent pair (`play`/`pause`), Spotify 403s "Restriction violated" when the
-/// player is already in the requested state — swallow that and return the
-/// snapshot, so `play` while playing is a no-op success (contract rule). The
+/// Run a play/pause/next/prev command, then reply with a settled snapshot (fio
+/// A2). For the idempotent pair (`play`/`pause`), Spotify 403s "Restriction
+/// violated" when the player is already in the requested state — swallow that
+/// and return the snapshot, so `play` while playing is a no-op success
+/// (contract rule; the settle predicate is trivially satisfied there). The
 /// probe is gated on the error actually being a 403: on a 429/5xx the answer is
 /// already "no", and the extra player call would only feed the rate limiter.
 fn command(api: &dyn SpotifyApi, now_ms: i64, cmd: Control) -> String {
+    // The intent is captured BEFORE the command: once it lands, the flip the
+    // Skip predicate watches for may already be visible.
+    let intent = match cmd {
+        Control::Resume => Intent::Play,
+        Control::Pause => Intent::Pause,
+        Control::Next | Control::Prev => Intent::Skip {
+            pre_track_id: pre_track_id(api, now_ms),
+        },
+        Control::Volume(v) => Intent::Volume(v),
+    };
     match api.control(cmd) {
         Ok(()) => {
             // Only next/prev can change the upcoming queue; play/pause/volume
@@ -441,9 +457,11 @@ fn command(api: &dyn SpotifyApi, now_ms: i64, cmd: Control) -> String {
             if matches!(cmd, Control::Next | Control::Prev) {
                 api.invalidate_queue_cache();
             }
-            fresh_now(api, now_ms)
+            settled_now(api, now_ms, &intent)
         }
-        Err(e) if e.contains("HTTP 403") && already_in_state(api, cmd) => fresh_now(api, now_ms),
+        Err(e) if e.contains("HTTP 403") && already_in_state(api, cmd) => {
+            settled_now(api, now_ms, &intent)
+        }
         Err(e) => upstream(&e),
     }
 }
@@ -504,12 +522,167 @@ fn now_document(api: &dyn SpotifyApi, now_ms: i64) -> String {
     doc
 }
 
-/// A command's reply: bust the micro-cache (so this and every later `/now`
-/// reflects the command instead of a pre-command snapshot), then return a fresh
-/// `/now` document — which also reseeds the cache with post-command state.
-fn fresh_now(api: &dyn SpotifyApi, now_ms: i64) -> String {
+// ---- Settle-before-return (fio A2) ------------------------------------------
+// Spotify's player state is eventually consistent (~1-2 s), so the snapshot a
+// command used to return could still show pre-command state — a "lying"
+// snapshot every client then paid for with its own ack/timeout machinery
+// (Casquinha b48 watching track_id flip for 8 s). Commands now short-poll the
+// player until a PURE predicate says the snapshot reflects the intent, bounded
+// at 4 polls ~500 ms apart (~2 s cap). Best-effort by design: on timeout the
+// latest snapshot is returned anyway (today's behavior, never an error), and a
+// rate-limit arming mid-settle aborts immediately (settling must never amplify
+// a 429).
+
+/// Settle polls per command: the first is immediate (what commands always did),
+/// each retry is preceded by [`SpotifyApi::settle_wait`] (~500 ms).
+const SETTLE_ATTEMPTS: u32 = 4;
+/// The nominal gap between settle polls, mirrored in `Client::settle_wait`.
+/// Also the elapsed-time estimate fed to the [`Intent::Seek`] window.
+const SETTLE_INTERVAL_MS: u64 = 500;
+
+/// What a command intends the player state to become — captured BEFORE the
+/// command is issued (`Skip` compares against the pre-command track).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Intent {
+    /// `play`: the player resumes.
+    Play,
+    /// `pause`: the player pauses (a track stays loaded).
+    Pause,
+    /// `next`/`prev`: the track flips away from the pre-command one. `None`
+    /// pre-id (no recent snapshot to read it from) settles immediately —
+    /// there is no fact to compare against, so behave as before A2.
+    Skip { pre_track_id: Option<String> },
+    /// `volume?v`: the device reports exactly `v`.
+    Volume(u8),
+    /// `seek?p`: the position landed at `p` — a window, not equality, because
+    /// playback keeps advancing while we wait.
+    Seek { target_ms: u64 },
+    /// `wake[?play=1]`: gopher-spot is the active device (and playing, if asked).
+    Wake { play: bool },
+    /// `play/from`: the track at `offset` is what's loaded.
+    PlayFrom { track_id: String },
+}
+
+/// The settle predicate: does `snap` already reflect `intent`? PURE
+/// (`intent + snapshot + elapsed → bool`) — this is where the test value is;
+/// the polling loop around it is trivial glue. `elapsed_ms` is the nominal
+/// time since the command (attempt × interval), which widens the seek window
+/// as playback advances under us.
+pub fn settled(intent: &Intent, snap: &Playing, elapsed_ms: u64) -> bool {
+    match intent {
+        Intent::Play => snap.is_playing && snap.item.is_some(),
+        Intent::Pause => !snap.is_playing && snap.item.is_some(),
+        Intent::Skip { pre_track_id: None } => true,
+        Intent::Skip {
+            pre_track_id: Some(pre),
+        } => match &snap.item {
+            // Skipping past the end of the queue legitimately stops playback.
+            None => true,
+            Some(t) => t.id.as_deref() != Some(pre.as_str()),
+        },
+        Intent::Volume(v) => {
+            matches!(&snap.device, Some(d) if d.volume_percent == Some(*v as u32))
+        }
+        Intent::Seek { target_ms } => {
+            snap.progress_ms >= *target_ms
+                && snap.progress_ms <= target_ms + elapsed_ms + SETTLE_SEEK_SLACK_MS
+        }
+        Intent::Wake { play } => {
+            let active = matches!(&snap.device, Some(d) if d.name == "gopher-spot");
+            active && (!play || snap.is_playing)
+        }
+        Intent::PlayFrom { track_id } => {
+            matches!(&snap.item, Some(t) if t.id.as_deref() == Some(track_id.as_str()))
+        }
+    }
+}
+
+/// Slack on the seek window: Spotify's reported position is ~1 s-grained plus
+/// a round-trip, so demand `[target, target + elapsed + slack]`, not equality.
+const SETTLE_SEEK_SLACK_MS: u64 = 1_500;
+
+/// The value of `key` in a rendered v1 document — lets a command read the
+/// pre-command state off the last snapshot without paying an upstream call.
+fn doc_value<'a>(doc: &'a str, key: &str) -> Option<&'a str> {
+    doc.split("\r\n")
+        .filter_map(|l| l.split_once('\t'))
+        .find(|(k, _)| *k == key)
+        .map(|(_, v)| v)
+}
+
+/// The pre-command track id for a `Skip` intent, read from the last good
+/// snapshot (the ~30 s stale copy `store_now` keeps, refreshed by every `/now`
+/// fetch — under any polling client it is at most one poll old). Zero upstream
+/// cost; `None` (no recent snapshot, or nothing was loaded) degrades the skip
+/// to settling on its first poll, exactly the pre-A2 behavior.
+fn pre_track_id(api: &dyn SpotifyApi, now_ms: i64) -> Option<String> {
+    api.stale_now(now_ms)
+        .and_then(|doc| doc_value(&doc, "track_id").map(str::to_string))
+}
+
+/// A command's reply (fio A2): bust the micro-cache, then short-poll the player
+/// until the snapshot reflects `intent` (or the attempts run out — the latest
+/// snapshot is returned regardless, never an error). The settled snapshot is
+/// stored as the fresh `now_snapshot`, so followers read post-command state.
+/// Deliberately NOT under `now_fetch_lock`: holding it across the settle would
+/// park concurrent `/now` polls for up to ~2 s.
+fn settled_now(api: &dyn SpotifyApi, now_ms: i64, intent: &Intent) -> String {
     api.invalidate_now_cache();
-    now_document(api, now_ms)
+    let mut last: Option<(Playing, u64)> = None;
+    let mut first_err: Option<String> = None;
+    for attempt in 0..SETTLE_ATTEMPTS {
+        if attempt > 0 {
+            api.settle_wait();
+        }
+        let elapsed = attempt as u64 * SETTLE_INTERVAL_MS;
+        match api.now_playing() {
+            Ok(p) => {
+                let done = settled(intent, &p, elapsed);
+                last = Some((p, elapsed));
+                if done {
+                    break;
+                }
+            }
+            // Any failure ends the settle: the rate_limited sentinel means a
+            // cooldown armed mid-settle (polling on would amplify the 429),
+            // and other upstream errors won't heal within a poll interval.
+            Err(e) => {
+                if last.is_none() {
+                    first_err = Some(e);
+                }
+                break;
+            }
+        }
+    }
+    match last {
+        Some((p, elapsed)) => {
+            let queue_len = if p.item.is_some() {
+                api.queue().map(|q| q.len()).unwrap_or(0)
+            } else {
+                0
+            };
+            // Stamp ts with the settle clock: the position was sampled up to
+            // ~1.5 s after the request landed, and a client interpolates from
+            // ts — the request-time stamp would double-count that gap.
+            let ts = now_ms + elapsed as i64;
+            let doc = snapshot(&p, queue_len, ts);
+            api.store_now(ts, &doc);
+            doc
+        }
+        // No snapshot at all: same degradation ladder as /now (stale serve
+        // during a cooldown, else the upstream error).
+        None => {
+            let e = first_err.unwrap_or_default();
+            if e.starts_with(crate::spotify::RATE_LIMITED) {
+                match api.stale_now(now_ms) {
+                    Some(doc) => doc,
+                    None => upstream(&e),
+                }
+            } else {
+                upstream(&e)
+            }
+        }
+    }
 }
 
 /// The `/now` document. Metadata keys (`track`..`duration_ms`) appear only when a
@@ -705,6 +878,11 @@ mod tests {
         // rate_limited: sentinel); `stale_doc` is what stale_now() serves.
         now_fails: Option<ApiError>,
         stale_doc: Option<String>,
+        // fio A2: when non-empty, now_playing() consumes this sequence front-
+        // first (then falls back to the fields above) — lets a test script an
+        // eventually-consistent player; `waits` counts settle_wait() pauses.
+        now_seq: RefCell<Vec<Result<Playing, ApiError>>>,
+        waits: RefCell<u32>,
     }
     fn fake(playing: Playing) -> Fake {
         Fake {
@@ -723,6 +901,8 @@ mod tests {
             last_wake: RefCell::new(None),
             now_fails: None,
             stale_doc: None,
+            now_seq: RefCell::new(Vec::new()),
+            waits: RefCell::new(0),
         }
     }
     /// The Spotify idempotency 403 the `control_fails` tests exercise.
@@ -754,10 +934,17 @@ mod tests {
     impl SpotifyApi for Fake {
         fn now_playing(&self) -> Result<Playing, ApiError> {
             *self.now_calls.borrow_mut() += 1;
+            let mut seq = self.now_seq.borrow_mut();
+            if !seq.is_empty() {
+                return seq.remove(0);
+            }
             if let Some(e) = &self.now_fails {
                 return Err(e.clone());
             }
             Ok(self.playing.clone())
+        }
+        fn settle_wait(&self) {
+            *self.waits.borrow_mut() += 1;
         }
         fn stale_now(&self, _now_ms: i64) -> Option<String> {
             self.stale_doc.clone()
@@ -1440,6 +1627,266 @@ mod tests {
         assert_eq!(*f.now_calls.borrow(), 0, "no probe on a non-403 failure");
     }
 
+    // ---- fio A2: settle-before-return ------------------------------------------
+
+    /// The same playing snapshot with a different loaded track id.
+    fn with_track_id(mut p: Playing, id: &str) -> Playing {
+        if let Some(t) = p.item.as_mut() {
+            t.id = Some(id.into());
+        }
+        p
+    }
+    /// The same snapshot with a different active device.
+    fn with_device(mut p: Playing, name: &str, volume: Option<u32>) -> Playing {
+        p.device = Some(Device {
+            id: Some("d9".into()),
+            name: name.into(),
+            is_active: true,
+            volume_percent: volume,
+        });
+        p
+    }
+    /// A stale `/now` doc carrying the pre-command track — what `pre_track_id`
+    /// reads instead of paying an upstream call.
+    fn stale_with_track(id: &str) -> Option<String> {
+        Some(format!(
+            "api\t1\r\nstate\tplaying\r\ntrack_id\t{id}\r\nts\t123\r\n"
+        ))
+    }
+
+    #[test]
+    fn doc_value_reads_the_wire_format() {
+        let doc = "api\t1\r\nstate\tplaying\r\ntrack_id\tabc123\r\nts\t9\r\n";
+        assert_eq!(doc_value(doc, "track_id"), Some("abc123"));
+        assert_eq!(doc_value(doc, "state"), Some("playing"));
+        assert_eq!(doc_value(doc, "volume"), None);
+        assert_eq!(doc_value("", "track_id"), None);
+    }
+
+    #[test]
+    fn settle_predicate_play_and_pause() {
+        let playing = playing_track();
+        let mut paused = playing_track();
+        paused.is_playing = false;
+        assert!(settled(&Intent::Play, &playing, 0));
+        assert!(!settled(&Intent::Play, &paused, 0));
+        assert!(
+            !settled(&Intent::Play, &stopped(), 0),
+            "no track loaded yet"
+        );
+        assert!(settled(&Intent::Pause, &paused, 0));
+        assert!(!settled(&Intent::Pause, &playing, 0));
+        assert!(!settled(&Intent::Pause, &stopped(), 0));
+    }
+
+    #[test]
+    fn settle_predicate_skip() {
+        let pre = Intent::Skip {
+            pre_track_id: Some("abc123".into()),
+        };
+        // Same track -> the flip hasn't landed.
+        assert!(!settled(&pre, &playing_track(), 0));
+        // Track changed -> settled.
+        assert!(settled(&pre, &with_track_id(playing_track(), "zzz999"), 0));
+        // Skipped past the last track (stopped) -> settled.
+        assert!(settled(&pre, &stopped(), 0));
+        // An item with no id at all differs from a known pre id.
+        let mut anon = playing_track();
+        anon.item.as_mut().unwrap().id = None;
+        assert!(settled(&pre, &anon, 0));
+        // No pre-command fact -> nothing to compare, settle immediately.
+        let blind = Intent::Skip { pre_track_id: None };
+        assert!(settled(&blind, &playing_track(), 0));
+    }
+
+    #[test]
+    fn settle_predicate_volume() {
+        // playing_track()'s device reports 65.
+        assert!(settled(&Intent::Volume(65), &playing_track(), 0));
+        assert!(!settled(&Intent::Volume(70), &playing_track(), 0));
+        // No device (nothing to read the volume from) -> not settled.
+        assert!(!settled(&Intent::Volume(70), &stopped(), 0));
+        // A device that doesn't report volume -> not settled.
+        let mute = with_device(playing_track(), "gopher-spot", None);
+        assert!(!settled(&Intent::Volume(70), &mute, 0));
+    }
+
+    #[test]
+    fn settle_predicate_seek_is_a_window_not_equality() {
+        let at = |ms: u64| {
+            let mut p = playing_track();
+            p.progress_ms = ms;
+            p
+        };
+        let seek = Intent::Seek { target_ms: 60_000 };
+        // Still at the pre-seek position -> not settled.
+        assert!(!settled(&seek, &at(42_000), 0));
+        // Landed exactly, or advanced a little while we waited -> settled.
+        assert!(settled(&seek, &at(60_000), 0));
+        assert!(settled(&seek, &at(61_000), 0)); // inside target + 0 + 1500
+        assert!(settled(&seek, &at(62_400), 1_000)); // inside target + 1000 + 1500
+                                                     // Way past the window -> that's not our seek reflecting.
+        assert!(!settled(&seek, &at(70_000), 0));
+        // The window widens with elapsed time (playback keeps advancing).
+        assert!(!settled(&seek, &at(62_400), 0));
+    }
+
+    #[test]
+    fn settle_predicate_wake() {
+        let ours = playing_track(); // device gopher-spot, playing
+        let phone = with_device(playing_track(), "iPhone", Some(40));
+        assert!(settled(&Intent::Wake { play: false }, &ours, 0));
+        assert!(!settled(&Intent::Wake { play: false }, &phone, 0));
+        assert!(!settled(&Intent::Wake { play: false }, &stopped(), 0));
+        // play=1 additionally demands the player actually playing.
+        assert!(settled(&Intent::Wake { play: true }, &ours, 0));
+        let mut ours_paused = playing_track();
+        ours_paused.is_playing = false;
+        assert!(!settled(&Intent::Wake { play: true }, &ours_paused, 0));
+        assert!(settled(&Intent::Wake { play: false }, &ours_paused, 0));
+    }
+
+    #[test]
+    fn settle_predicate_play_from() {
+        let want = Intent::PlayFrom {
+            track_id: "zzz999".into(),
+        };
+        assert!(settled(&want, &with_track_id(playing_track(), "zzz999"), 0));
+        assert!(!settled(&want, &playing_track(), 0)); // still the old track
+        assert!(!settled(&want, &stopped(), 0));
+    }
+
+    #[test]
+    fn next_settles_when_the_track_flips() {
+        let f = Fake {
+            stale_doc: stale_with_track("abc123"),
+            ..fake(playing_track())
+        };
+        // Spotify is eventually consistent: two stale echoes, then the flip.
+        *f.now_seq.borrow_mut() = vec![
+            Ok(playing_track()),
+            Ok(playing_track()),
+            Ok(with_track_id(playing_track(), "zzz999")),
+        ];
+        let out = call(&f, "/spot/api/1/next");
+        assert!(out.contains("track_id\tzzz999\r\n"), "settled reply: {out}");
+        assert_eq!(*f.now_calls.borrow(), 3, "stopped polling once settled");
+        assert_eq!(*f.waits.borrow(), 2, "one pause before each retry");
+        // ts is stamped with the settle clock (2 retries x 500ms), not the
+        // request clock — the client interpolates from it.
+        assert!(out.contains(&format!("ts\t{}\r\n", TS + 1_000)), "{out}");
+    }
+
+    #[test]
+    fn settle_times_out_and_returns_the_latest_snapshot_anyway() {
+        // The player never reflects the skip (the fake keeps serving the same
+        // track): the settle exhausts its budget and the reply is the latest
+        // snapshot — never an error (best-effort by contract).
+        let f = Fake {
+            stale_doc: stale_with_track("abc123"),
+            ..fake(playing_track())
+        };
+        let out = call(&f, "/spot/api/1/next");
+        assert!(!out.contains("error\t"), "{out}");
+        assert!(out.contains("track_id\tabc123\r\n"), "latest echo: {out}");
+        assert_eq!(*f.now_calls.borrow(), 4, "the full settle budget");
+        assert_eq!(*f.waits.borrow(), 3);
+    }
+
+    #[test]
+    fn skip_without_a_pre_fact_settles_on_the_first_poll() {
+        // No stale snapshot to read the pre-command track from -> exactly the
+        // pre-A2 behavior: one fetch, no waits.
+        let f = fake(playing_track());
+        call(&f, "/spot/api/1/next");
+        assert_eq!(*f.now_calls.borrow(), 1);
+        assert_eq!(*f.waits.borrow(), 0);
+    }
+
+    #[test]
+    fn settle_aborts_when_a_rate_limit_arms_mid_flight() {
+        // A 429 cooldown arming between polls must end the settle immediately
+        // (never amplify a rate-limit event) and reply with the last snapshot.
+        let f = Fake {
+            stale_doc: stale_with_track("abc123"),
+            ..fake(playing_track())
+        };
+        *f.now_seq.borrow_mut() = vec![
+            Ok(playing_track()),
+            Err("rate_limited: spotify HTTP 429 (retry after 5s)".into()),
+        ];
+        let out = call(&f, "/spot/api/1/next");
+        assert!(!out.contains("error\t"), "{out}");
+        assert!(out.contains("track_id\tabc123\r\n"));
+        assert_eq!(*f.now_calls.borrow(), 2, "no third poll after the 429");
+    }
+
+    #[test]
+    fn settle_first_poll_rate_limited_serves_the_stale_doc() {
+        // The command landed but the very first settle poll hit a cooldown:
+        // same degradation ladder as /now — the stale doc, verbatim.
+        let stale = stale_with_track("abc123").unwrap();
+        let f = Fake {
+            stale_doc: Some(stale.clone()),
+            ..fake(playing_track())
+        };
+        *f.now_seq.borrow_mut() = vec![Err(
+            "rate_limited: spotify cooldown active (until ~9)".into()
+        )];
+        let out = call(&f, "/spot/api/1/next");
+        assert_eq!(out, stale);
+    }
+
+    #[test]
+    fn volume_settles_on_the_reported_value() {
+        let f = fake(playing_track()); // device reports 65
+        *f.now_seq.borrow_mut() = vec![
+            Ok(playing_track()), // still 65
+            Ok(with_device(playing_track(), "gopher-spot", Some(70))),
+        ];
+        let out = call(&f, "/spot/api/1/volume?70");
+        assert!(out.contains("volume\t70\r\n"), "{out}");
+        assert_eq!(*f.now_calls.borrow(), 2);
+    }
+
+    #[test]
+    fn wake_settles_when_the_transfer_lands() {
+        let f = fake(playing_track());
+        *f.now_seq.borrow_mut() = vec![
+            Ok(with_device(playing_track(), "iPhone", Some(40))), // pre-transfer echo
+            Ok(playing_track()),                                  // gopher-spot active
+        ];
+        let out = call(&f, "/spot/api/1/wake?play=1");
+        assert!(out.contains("device\tactive\r\n"), "{out}");
+        assert_eq!(*f.now_calls.borrow(), 2);
+        assert_eq!(*f.waits.borrow(), 1);
+    }
+
+    #[test]
+    fn settled_reply_reseeds_the_now_cache() {
+        // The snapshot the settle ends on becomes the fresh now_snapshot, so a
+        // follower poll right after the command is a cache hit on POST-command
+        // state (fio S3/2 synergy, now with the settled doc).
+        let f = Fake {
+            stale_doc: stale_with_track("abc123"),
+            ..fake(playing_track())
+        };
+        *f.now_seq.borrow_mut() = vec![
+            Ok(playing_track()),
+            Ok(with_track_id(playing_track(), "zzz999")),
+        ];
+        let args = DcgiArgs::from_argv(&argv("/spot/api/1/next"));
+        route(&args.path(), &args, Some(&f), None, TS);
+        let fetches_after_command = *f.now_calls.borrow();
+        let follow = now_at(&f, TS + 600);
+        assert_eq!(
+            *f.now_calls.borrow(),
+            fetches_after_command,
+            "follower must hit the reseeded cache"
+        );
+        assert!(follow.contains("track_id\tzzz999\r\n"), "{follow}");
+    }
+
     // ---- fio S3/3: device + wake ----------------------------------------------
 
     #[test]
@@ -1673,7 +2120,13 @@ mod tests {
             1,
             "a jump replaces the upcoming queue"
         );
-        assert_eq!(*f.now_calls.borrow(), 2, "reply must be a fresh snapshot");
+        // The fake never flips to ID_A, so the reply settles by exhausting its
+        // attempts: the initial poll + the full settle budget, all fresh.
+        assert_eq!(
+            *f.now_calls.borrow(),
+            1 + 4,
+            "reply must be freshly fetched (and settled)"
+        );
     }
 
     #[test]

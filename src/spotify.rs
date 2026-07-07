@@ -319,6 +319,10 @@ pub trait SpotifyApi {
     fn stale_now(&self, _now_ms: i64) -> Option<String> {
         None
     }
+    /// Pause between settle polls (fio A2): commands short-poll the player
+    /// until the snapshot reflects the command, ~500 ms apart. Default no-op so
+    /// fakes/tests run instantly; the real [`Client`] sleeps.
+    fn settle_wait(&self) {}
 }
 
 // ---- The real blocking client (net feature) --------------------------------
@@ -1032,6 +1036,12 @@ mod net {
         }
         fn stale_now(&self, now_ms: i64) -> Option<String> {
             cache::get(&self.state_dir, "now_snapshot_stale", now_ms)
+        }
+        fn settle_wait(&self) {
+            // Half a beat between settle polls (fio A2). 4 polls × 500 ms plus
+            // their round-trips stays well inside geomyidae's ~10 s request
+            // budget.
+            std::thread::sleep(std::time::Duration::from_millis(500));
         }
     }
 

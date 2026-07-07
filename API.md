@@ -146,7 +146,10 @@ Spotify OAuth Secret is missing (it is not a Spotify endpoint).
 ### Commands
 
 Each command executes, then returns the same **`/now` snapshot** so the client
-leaves with fresh state in one round-trip.
+leaves with fresh state in one round-trip. Since fio A2 the server **settles**
+the snapshot before returning it: it short-polls Spotify (up to ~2 s) until
+the snapshot reflects the command, so the reply *usually* already shows the
+new track / state / volume — see [Known deviations](#known-deviations).
 
 ```
 /spot/api/1/play
@@ -450,13 +453,21 @@ Client-side rules for all of this — cadence, backoff, caching — live in
   resource can take up to ~5 minutes to appear. Don't retry-loop a `not_found`.
 - **`queue_len` is best-effort.** The queue is cached ~10 s server-side, and when
   nothing is playing `/now` reports `queue_len` `0` without consulting Spotify.
-- **Eventual consistency after a command.** The snapshot a command returns
-  reflects what Spotify's Web API reports *at that instant*. Spotify is eventually
-  consistent for the librespot Connect device: a `seek` (and sometimes the device
-  `volume`) settles on Spotify's side ~1–2 s later, so the returned snapshot can
-  still show the pre-command `position_ms`/`volume`. The command **did** take
-  effect; re-poll `/now` (and interpolate via `ts`) for the settled value. This is
-  inherent to driving playback through the Web API rather than a local librespot
-  control socket (librespot exposes none).
+- **Eventual consistency after a command.** Spotify is eventually consistent
+  for the librespot Connect device: a command's effect appears in the player
+  state ~1–2 s later. **Since fio A2 the server absorbs most of this**: after
+  issuing a command it short-polls the player (up to 4 polls, ~500 ms apart,
+  ~2 s cap) until the snapshot *reflects* the command — the new `track_id`
+  after `next`/`prev`/`play/from`, the target `state` after `play`/`pause`,
+  the requested `volume`, a `position_ms` inside the seek window, `device
+  active` after `wake` — and returns (and caches) that settled snapshot. The
+  settle is strictly **best-effort**: on timeout the latest snapshot is
+  returned anyway (never an error), and if a rate-limit cooldown arms
+  mid-settle the polling stops immediately. So clients must still tolerate
+  the **rare** unsettled echo (a reply that shows pre-command state): the
+  command **did** take effect; re-poll `/now` for the settled value. Note the
+  reply's `ts` is stamped when the settled reading was taken (up to ~1.5 s
+  after the request landed) — interpolate from it as usual. Old servers
+  (pre-A2) return the instant, possibly-unsettled snapshot every time.
 - `position_ms` precision: it is Spotify's reported device position at fetch time,
   typically accurate to ~1 s, plus one network RTT. Interpolate with `ts`.

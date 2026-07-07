@@ -88,9 +88,14 @@ this document is only about *how to consume it well*.
 20. **Trust the server's clamps.** `seek` clamps to the track duration and
     `volume` rejects out-of-range values server-side; client-side pre-validation
     is only a UX nicety.
-21. **Expect eventual consistency after `seek`/`volume`.** The reply snapshot
-    can still show the pre-command value; it settles within ~1–2 s of polling.
-    Don't re-issue the command because the echo looks stale.
+21. **Tolerate the (now rare) unsettled command echo.** Since fio A2 the server
+    settles the reply snapshot before returning it (short-polling Spotify up to
+    ~2 s), so a command's reply *usually* already reflects it — a skip's reply
+    carries the new `track_id`, a `wake?play=1` reply says `device` `active`.
+    But settling is best-effort (it times out, and it aborts during a 429
+    cooldown), and **old servers don't settle at all** — so keep the tolerance:
+    if the echo looks pre-command, the command still took effect; let the next
+    poll catch up. Don't re-issue the command because the echo looks stale.
 22. **Parse forward-compatibly.** `key<TAB>value`, CRLF lines, UTF-8. Ignore
     unknown keys (v1 grows additively) and tolerate keys appearing in any order.
     Metadata keys (`track`…`duration_ms`) exist only when a track is loaded —
