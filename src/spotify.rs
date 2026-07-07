@@ -345,6 +345,10 @@ mod net {
                                  // still say 0-50, but 20 empirically 400s and 10 works — an API quirk). 10 is
                                  // plenty for a Gopher menu.
     const SEARCH_LIMIT: u32 = 10;
+    // Same undocumented dev-mode cap as SEARCH_LIMIT, but on `/v1/artists/{id}/
+    // albums` (20 -> 400 "Invalid limit"; verified live 2026-07-07). Endpoint-
+    // specific: album-tracks / playlists still accept PAGE_SIZE(20).
+    const ARTIST_ALBUMS_LIMIT: u32 = 10;
     const DEVICES_TTL: i64 = 30; // 30 s
     const PLAYLISTS_TTL: i64 = 60; // 60 s
     const CATALOG_TTL: i64 = 86_400; // 24h — albums/artists are effectively static
@@ -968,11 +972,16 @@ mod net {
         }
 
         fn artist_albums(&self, id: &str, offset: u32) -> Result<AlbumsPage, ApiError> {
+            // limit=10, NOT PAGE_SIZE(20): `/v1/artists/{id}/albums` 400s "Invalid
+            // limit" at 20 for this dev-mode app — the same undocumented cap that
+            // pins `/v1/search` at 10 (verified live 2026-07-07; the docs claim a
+            // max of 50, but this app's quota disagrees). Album-tracks / playlists
+            // still take 20, so the cap is endpoint-specific — keep it local here.
             let body = self.get_cached(
                 &format!("artistalbums:{id}:{offset}"),
                 CATALOG_TTL,
                 &format!(
-                    "/v1/artists/{id}/albums?include_groups=album,single&limit={PAGE_SIZE}&offset={offset}"
+                    "/v1/artists/{id}/albums?include_groups=album,single&limit={ARTIST_ALBUMS_LIMIT}&offset={offset}"
                 ),
             )?;
             let r: RawArtistAlbums = serde_json::from_str(&body).map_err(|e| e.to_string())?;
