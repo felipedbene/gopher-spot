@@ -86,14 +86,19 @@ cat > "$IC/icecast.xml" <<EOF
          (a drop forces a failover→silence + a full live-chain respawn). Long
          genuine idle/pause still exceeds this and correctly fails to silence. -->
     <source-timeout>20</source-timeout>
-    <!-- Keep listeners near the live edge. burst-size is the backlog sent on
-         connect (prebuffer): ~1s at 128k. queue-size caps how far a slightly-slow
-         client may drift before Icecast trims it: ~16s instead of the old ~64s
-         (a full song). Lower these further only if the client keeps up cleanly;
-         if MacAST underruns/disconnects, it can't sustain the bitrate — drop
-         MP3_BITRATE instead. -->
-    <burst-size>16384</burst-size>
-    <queue-size>262144</queue-size>
+    <!-- Freeze-immunity cushion for Casquinha (design/SPEC-burst.md in the
+         casquinha repo). burst-size is the backlog replayed on connect: ~256 KB
+         = ~16s at 128k, enough to fill the client's decode rings in the first
+         second so a preemptive MP decode task can play through cooperative-loop
+         freezes (menu tracking, window drags). queue-size is how far a stalled
+         client may lag before Icecast disconnects it: ~2 MB = ~2 min (the old
+         256 KB dropped clients frozen ~36s: "stream closed by server").
+         Casquinha is the only listener class and trims to the live edge
+         client-side, so the burst adds no perceived latency there; a client
+         that does NOT trim will start ~16s behind live. Memory cost is
+         per-listener worst-case ~2 MB, trivial at <clients>20</clients>. -->
+    <burst-size>262144</burst-size>
+    <queue-size>2097152</queue-size>
   </limits>
   <authentication>
     <source-password>${ICECAST_SOURCE_PASS}</source-password>
