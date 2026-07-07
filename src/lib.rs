@@ -24,3 +24,4 @@ pub mod latin1;
 pub mod macroman;
 pub mod menu;
 pub mod spotify;
+pub mod stream;

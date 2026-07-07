@@ -96,6 +96,18 @@ this document is only about *how to consume it well*.
     Metadata keys (`track`…`duration_ms`) exist only when a track is loaded —
     key off `state` first.
 
+## The media plane (`/stream`)
+
+23. **Poll `/stream` at the same lazy cadence as `/now`, or lazier** (10 s is
+    plenty — it's a slow-moving fact; the server caches it ~2 s anyway). Use it
+    to *reconcile*, not to render playback state: "waiting on the audio chain"
+    is `live` `0` **while** `/now` says `state` `playing` + `device` `active` —
+    a server fact, replacing any "my receive went dry" guessing. Everything
+    else about `live` `0` is expected silence (paused/idle), not an error.
+24. **Feature-detect `/stream` once per launch.** An old server answers
+    `not_found`; on that, stop asking for the rest of the run and fall back to
+    your receive-side heuristic. Don't retry-loop it (rule 8 applies).
+
 ## Spot-check checklist
 
 Watch one client session (server logs + a packet trace or client debug log) and
@@ -116,6 +128,7 @@ tick these off:
 | 11 | Unknown keys | feeding the client an extra `x_test<TAB>1` line changes nothing |
 | 12 | Errors | client switches on `error` code; `message` text nowhere in client logic |
 | 13 | List jump | one `play/from` per jump; no `/next` chains; no end-of-track watchdog issuing plays |
+| 14 | `/stream` | cadence ≥ the `/now` cadence; one feature-detect per launch; "waiting" UI only when `live` `0` ∧ `playing` ∧ `active` |
 
 A quick server-side way to observe a client's request pattern (geomyidae logs
 every selector):

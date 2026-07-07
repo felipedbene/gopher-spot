@@ -100,6 +100,49 @@ queue_len	0
 ts	1783105644431
 ```
 
+### Stream (added 2026-07, fio A)
+
+```
+/spot/api/1/stream
+```
+
+The **media plane reporting its own state**: what the Icecast audio stream
+(`:8000/spotify.mp3`) is actually carrying, straight from Icecast's mount
+stats. This is a different state owner than `/now` (which reports what the
+Spotify Web API believes) — the two can legitimately disagree for a few
+seconds, and comparing them is the point.
+
+| key         | when   | value                                                       |
+|-------------|--------|--------------------------------------------------------------|
+| `api`       | always | `1`                                                          |
+| `live`      | always | `1` — a live source feeds `/spotify.mp3` (real audio); `0` — the silence fallback is carrying (idle/paused past the source timeout, or the audio chain is down/respawning) |
+| `listeners` | always | **external** listeners on the stream (the server's permanent internal drainer is subtracted, clamped at ≥ 0) |
+| `ts`        | always | unix epoch **ms** when the server took the reading            |
+
+How to read it:
+
+- **`live 1`** — librespot's chain has an active source on the mount; the
+  stream carries real audio (what plays is what `/now` describes, modulo the
+  stream's ~3 s encoder latency).
+- **`live 0` while `/now` says `state playing` + `device active`** — the
+  genuine **anomaly**: Spotify believes the gopher-spot device is playing but
+  the mount carries no audio (the chain is dead/respawning). This is the
+  server-fact replacement for client-side "my receive went dry" heuristics
+  ("waiting for Spotify"). Everything else about `live 0` is normal: paused or
+  idle long enough for Icecast to drop the source is *expected* silence.
+- `listeners` counts across the live/fallback failover (Icecast moves parked
+  listeners to `/silence.mp3` when the live source drops), so it is stable
+  through pause/resume cycles.
+
+The document is served from a **~2 s micro-cache** and Icecast is fetched with
+a short dedicated timeout — `/stream` never adds load or latency to `/now`,
+and vice-versa (they consult different upstreams and never call each other's).
+Icecast unreachable → `error upstream`. `/stream` answers even when the
+Spotify OAuth Secret is missing (it is not a Spotify endpoint).
+
+> **Feature-detect:** on an older server this selector answers `not_found` —
+> the client's signal to keep its receive-side heuristic instead.
+
 ### Commands
 
 Each command executes, then returns the same **`/now` snapshot** so the client

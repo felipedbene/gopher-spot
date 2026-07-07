@@ -21,6 +21,7 @@
 
 use crate::dcgi::DcgiArgs;
 use crate::spotify::{Control, Playing, PlaylistsPage, SpotifyApi, Track, TracksPage};
+use crate::stream::{StreamFacts, StreamSource};
 
 /// The contract version, emitted as the leading `api` key on every response.
 pub const API_VERSION: u32 = 1;
@@ -35,13 +36,25 @@ const COVER_SIZES: [u32; 3] = [64, 300, 640];
 /// JPEG on success and a v1 text error otherwise. `now_ms` is the dcgi's request
 /// wall-clock (unix epoch ms), stamped as `ts` so the client can interpolate the
 /// progress bar between polls.
-pub fn route(path: &str, args: &DcgiArgs, api: Option<&dyn SpotifyApi>, now_ms: i64) -> Vec<u8> {
+pub fn route(
+    path: &str,
+    args: &DcgiArgs,
+    api: Option<&dyn SpotifyApi>,
+    stream: Option<&dyn StreamSource>,
+    now_ms: i64,
+) -> Vec<u8> {
     // Only v1 exists. Everything else is a versioned 404 (a future /spot/api/2
     // would be routed here too).
     let sub = match path.strip_prefix("/spot/api/1") {
         Some(s) => s.trim_matches('/'),
         None => return error("not_found", "unknown api version").into_bytes(),
     };
+    // The media plane's own state (fio A): answered from Icecast, not Spotify —
+    // deliberately BEFORE the OAuth gate below, so /stream reports even when
+    // the Web API is unconfigured.
+    if sub == "stream" {
+        return stream_doc(stream, now_ms).into_bytes();
+    }
     // No OAuth Secret configured -> the whole upstream is unavailable. Report it
     // in-contract rather than serving a human mock menu.
     let api = match api {
@@ -76,6 +89,41 @@ pub fn route(path: &str, args: &DcgiArgs, api: Option<&dyn SpotifyApi>, now_ms: 
         other => error("not_found", &format!("unknown endpoint: {other}")),
     };
     text.into_bytes()
+}
+
+/// `/stream`: the media plane's own state — whether a live source feeds the
+/// `/spotify.mp3` mount, and how many external listeners hear it. `live 0`
+/// while `/now` reports `state playing` + `device active` is the genuine
+/// anomaly (librespot's chain lost the mount — the "waiting for Spotify" case
+/// clients used to infer from rx dryness). Served from a ~2 s micro-cache;
+/// Icecast unreachable/undecodable -> `error upstream` (never cached — same
+/// law as `/now`).
+fn stream_doc(src: Option<&dyn StreamSource>, now_ms: i64) -> String {
+    let src = match src {
+        Some(s) => s,
+        None => return error("upstream", "stream status not configured"),
+    };
+    if let Some(doc) = src.cached_stream(now_ms) {
+        return doc;
+    }
+    match src.stream_facts() {
+        Ok(f) => {
+            let doc = stream_snapshot(&f, now_ms);
+            src.store_stream(now_ms, &doc);
+            doc
+        }
+        Err(e) => error("upstream", &e),
+    }
+}
+
+/// The `/stream` document: `live` + external `listeners` + `ts`.
+fn stream_snapshot(f: &StreamFacts, now_ms: i64) -> String {
+    let mut out = String::new();
+    kv(&mut out, "api", &API_VERSION.to_string());
+    kv(&mut out, "live", if f.live { "1" } else { "0" });
+    kv(&mut out, "listeners", &f.listeners.to_string());
+    kv(&mut out, "ts", &now_ms.to_string());
+    out
 }
 
 /// `/queue`: the upcoming tracks as indexed `item.<i>.*` keys, in play order.
@@ -864,11 +912,11 @@ mod tests {
     /// tested against the raw `route` bytes instead.
     fn call(f: &Fake, selector: &str) -> String {
         let args = DcgiArgs::from_argv(&argv(selector));
-        String::from_utf8(route(&args.path(), &args, Some(f), TS)).unwrap()
+        String::from_utf8(route(&args.path(), &args, Some(f), None, TS)).unwrap()
     }
     fn call_bytes(f: &Fake, selector: &str) -> Vec<u8> {
         let args = DcgiArgs::from_argv(&argv(selector));
-        route(&args.path(), &args, Some(f), TS)
+        route(&args.path(), &args, Some(f), None, TS)
     }
 
     /// Every response is CRLF-terminated `key<TAB>value` with exactly one tab per
@@ -1015,7 +1063,7 @@ mod tests {
     #[test]
     fn no_api_reports_upstream_not_error_free() {
         let args = DcgiArgs::from_argv(&argv("/spot/api/1/now"));
-        let out = String::from_utf8(route(&args.path(), &args, None, TS)).unwrap();
+        let out = String::from_utf8(route(&args.path(), &args, None, None, TS)).unwrap();
         assert!(out.contains("error\tupstream\r\n"));
     }
 
@@ -1028,6 +1076,117 @@ mod tests {
         let out = call(&fake(p), "/spot/api/1/now");
         assert_wire(&out); // still exactly one tab per line
         assert!(out.contains("track\ta b c\r\n"));
+    }
+
+    // ---- fio A: /stream ---------------------------------------------------------
+
+    /// A fake media-plane source: canned facts (or a canned error), plus an
+    /// in-memory document cache mirroring the Fake's now-cache slot.
+    struct FakeStream {
+        facts: Result<StreamFacts, String>,
+        fetches: RefCell<u32>,
+        cache: RefCell<Option<(i64, String)>>,
+    }
+    fn fake_stream(live: bool, listeners: u64) -> FakeStream {
+        FakeStream {
+            facts: Ok(StreamFacts { live, listeners }),
+            fetches: RefCell::new(0),
+            cache: RefCell::new(None),
+        }
+    }
+    impl StreamSource for FakeStream {
+        fn stream_facts(&self) -> Result<StreamFacts, String> {
+            *self.fetches.borrow_mut() += 1;
+            self.facts.clone()
+        }
+        fn cached_stream(&self, now_ms: i64) -> Option<String> {
+            self.cache
+                .borrow()
+                .as_ref()
+                .filter(|(exp, _)| now_ms < *exp)
+                .map(|(_, d)| d.clone())
+        }
+        fn store_stream(&self, now_ms: i64, doc: &str) {
+            *self.cache.borrow_mut() = Some((now_ms + 2_000, doc.to_string()));
+        }
+    }
+
+    /// `/stream` at an explicit wall-clock. `api` is None on purpose in most
+    /// tests: the endpoint must not depend on the Spotify OAuth Secret.
+    fn stream_at(s: &FakeStream, now_ms: i64) -> String {
+        let args = DcgiArgs::from_argv(&argv("/spot/api/1/stream"));
+        String::from_utf8(route(&args.path(), &args, None, Some(s), now_ms)).unwrap()
+    }
+
+    #[test]
+    fn stream_reports_live_and_listeners() {
+        let s = fake_stream(true, 2);
+        let out = stream_at(&s, TS);
+        assert_wire(&out);
+        assert!(out.contains("api\t1\r\n"));
+        assert!(out.contains("live\t1\r\n"));
+        assert!(out.contains("listeners\t2\r\n"));
+        assert!(out.contains(&format!("ts\t{TS}\r\n")));
+    }
+
+    #[test]
+    fn stream_silence_fallback_is_live_zero() {
+        let out = stream_at(&fake_stream(false, 0), TS);
+        assert!(out.contains("live\t0\r\n"));
+        assert!(out.contains("listeners\t0\r\n"));
+    }
+
+    #[test]
+    fn stream_answers_without_the_spotify_api() {
+        // Explicitly: no OAuth Secret (api None) must NOT turn /stream into the
+        // "spotify api not configured" error — Icecast is its own state owner.
+        let out = stream_at(&fake_stream(true, 0), TS);
+        assert!(!out.contains("error\t"), "{out}");
+    }
+
+    #[test]
+    fn stream_unreachable_icecast_is_upstream() {
+        let s = FakeStream {
+            facts: Err("icecast status fetch failed: timeout".into()),
+            ..fake_stream(false, 0)
+        };
+        let out = stream_at(&s, TS);
+        assert_wire(&out);
+        assert!(out.contains("error\tupstream\r\n"), "{out}");
+    }
+
+    #[test]
+    fn stream_without_a_source_is_upstream() {
+        // The non-net build (or a future misconfig) has no fetcher at all.
+        let args = DcgiArgs::from_argv(&argv("/spot/api/1/stream"));
+        let out = String::from_utf8(route(&args.path(), &args, None, None, TS)).unwrap();
+        assert!(out.contains("error\tupstream\r\n"), "{out}");
+    }
+
+    #[test]
+    fn stream_polls_within_ttl_hit_the_cache() {
+        let s = fake_stream(true, 1);
+        let a = stream_at(&s, TS);
+        let b = stream_at(&s, TS + 1_500); // within the ~2s window
+        assert_eq!(*s.fetches.borrow(), 1, "second poll must be a cache hit");
+        assert_eq!(a, b, "same document, same ts");
+        stream_at(&s, TS + 2_000); // window over -> refetch
+        assert_eq!(*s.fetches.borrow(), 2);
+    }
+
+    #[test]
+    fn stream_errors_are_never_cached() {
+        let s = FakeStream {
+            facts: Err("icecast status fetch failed: boom".into()),
+            ..fake_stream(false, 0)
+        };
+        stream_at(&s, TS);
+        stream_at(&s, TS + 100);
+        assert_eq!(
+            *s.fetches.borrow(),
+            2,
+            "an error document must not stick for the TTL"
+        );
     }
 
     // ---- fio S2: queue --------------------------------------------------------
@@ -1138,7 +1297,7 @@ mod tests {
     /// Poll `/now` at an explicit wall-clock (ms), returning the document.
     fn now_at(f: &Fake, now_ms: i64) -> String {
         let args = DcgiArgs::from_argv(&argv("/spot/api/1/now"));
-        String::from_utf8(route(&args.path(), &args, Some(f), now_ms)).unwrap()
+        String::from_utf8(route(&args.path(), &args, Some(f), None, now_ms)).unwrap()
     }
 
     #[test]
@@ -1170,7 +1329,7 @@ mod tests {
                         // A command mid-window must invalidate: without the bust, `next`'s reply
                         // would read the still-valid cached snapshot (no fetch) -> count 1.
         let args = DcgiArgs::from_argv(&argv("/spot/api/1/next"));
-        route(&args.path(), &args, Some(&f), TS + 100);
+        route(&args.path(), &args, Some(&f), None, TS + 100);
         assert_eq!(*f.now_calls.borrow(), 2, "command forced a fresh snapshot");
         // The command reseeded the cache at TS+100, so a poll at TS+200 is a hit.
         now_at(&f, TS + 200);
@@ -1508,7 +1667,7 @@ mod tests {
         let f = fake(playing_track());
         now_at(&f, TS); // caches /now (fetch #1)
         let args = DcgiArgs::from_argv(&argv(&format!("/spot/api/1/play/from?ids={ID_A}")));
-        route(&args.path(), &args, Some(&f), TS + 100);
+        route(&args.path(), &args, Some(&f), None, TS + 100);
         assert_eq!(
             *f.queue_busts.borrow(),
             1,

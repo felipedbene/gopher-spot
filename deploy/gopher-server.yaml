@@ -17,6 +17,10 @@ data:
   # address.
   # Assigned by MetalLB on first apply.
   GOPHER_HOST: "10.0.100.112"
+  # Icecast's status JSON for /spot/api/1/stream (fio A). The in-cluster
+  # Service FQDN — pod-to-pod, never the LB. Matches the binary's default;
+  # kept explicit here so the knob is visible next to its siblings.
+  AUDIO_STATUS_URL: "http://audio-stream.gopher-spot.svc.cluster.local:8000/status-json.xsl"
 ---
 apiVersion: apps/v1
 kind: Deployment

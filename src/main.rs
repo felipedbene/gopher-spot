@@ -82,10 +82,20 @@ fn run_dcgi(rest: &[String]) -> DcgiOut {
         use gopher_spot::spotify::{Client, SpotifyApi};
         let state =
             std::env::var("SPOT_STATE_DIR").unwrap_or_else(|_| "/var/cache/spot".to_string());
-        let client = Client::from_env(now_ms / 1000, std::path::PathBuf::from(state));
+        let state_dir = std::path::PathBuf::from(&state);
+        let client = Client::from_env(now_ms / 1000, state_dir.clone());
         let api = client.as_ref().map(|c| c as &dyn SpotifyApi);
         if is_api {
-            DcgiOut::Api(gopher_spot::api::route(&path, &a, api, now_ms))
+            // The media plane's status source (fio A: /stream). Independent of
+            // the OAuth Secret — Icecast is the other state owner.
+            let icecast = gopher_spot::stream::IcecastStatus::from_env(state_dir);
+            DcgiOut::Api(gopher_spot::api::route(
+                &path,
+                &a,
+                api,
+                Some(&icecast),
+                now_ms,
+            ))
         } else {
             DcgiOut::Menu(dcgi::route(&a, api, now_ms))
         }
@@ -94,7 +104,7 @@ fn run_dcgi(rest: &[String]) -> DcgiOut {
     #[cfg(not(feature = "net"))]
     {
         if is_api {
-            DcgiOut::Api(gopher_spot::api::route(&path, &a, None, now_ms))
+            DcgiOut::Api(gopher_spot::api::route(&path, &a, None, None, now_ms))
         } else {
             DcgiOut::Menu(dcgi::route(&a, None, now_ms))
         }
