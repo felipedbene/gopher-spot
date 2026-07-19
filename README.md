@@ -277,13 +277,14 @@ classDiagram
 | `dcgi.rs`       | Parse geomyidae's 6 args; route a **human** selector to a gophermap. Pure, fake-testable. |
 | `api.rs`        | The **machine API** (`/spot/api/1/*`): tab-delimited UTF-8 (or raw cover JPEG) served verbatim by a `.cgi`. Frozen v1 contract — see [`API.md`](API.md). |
 | `spotify.rs`    | `SpotifyApi` trait + response models + the real blocking `ureq` `Client`.        |
+| `stream.rs`     | The `/spot/api/1/stream` media-plane endpoint: parses Icecast's public `status-json.xsl` into `{live, listeners}` facts (mount up = live audio; internal drainer subtracted from the listener count). Independent of the Web API — answers even with no OAuth Secret; own short-timeout `ureq` agent + ~2 s document micro-cache. Reads `AUDIO_STATUS_URL` (defaults to the in-cluster `audio-stream` Service). |
 | `cache.rs`      | File-backed TTL cache (token; search 5 min; devices 30 s; playlists 60 s; queue 10 s; albums/artists/covers 24 h; `/now` micro-cache ~3 s + 30 s stale copy; 429 cooldown = `Retry-After`; catalog 404s negative-cached 5 min). Atomic temp+rename writes; expired entries reaped on read. |
 | `latin1.rs`     | **UTF-8 → Latin-1** transcode (the default) so Netscape Communicator renders accents right. |
 | `macroman.rs`   | UTF-8 → Mac OS Roman transcode — the `GOPHER_ENCODING=macroman` fallback (TurboGopher). |
 | `menu.rs`       | The static root menu, the RFC-1436 66-column clip, the type-`s` `.pls` line.     |
 
-**97 unit tests**, all offline (`cargo test --no-default-features` builds the pure
-core — 88 tests; `cargo test` adds the URL-encoding, device-pick, circuit-breaker,
+**161 unit tests**, all offline (`cargo test --no-default-features` builds the pure
+core — 148 tests; `cargo test` adds the URL-encoding, device-pick, circuit-breaker,
 and cache-bust tests, still without a network). Rendering (human menus and the
 machine API) is tested against a fake `SpotifyApi`.
 
@@ -360,6 +361,7 @@ machine-parseable surface instead of scraping localized menu text. That's the
 | `cover/<album_id>/<size>` | **raw JPEG** (type-`I`), sizes 64/300/640, disk-cached 24 h. The one binary endpoint. |
 | `search?q=<urlencoded>` | track search (UTF-8 query); capped at 10 (Spotify 400s `limit>10`). |
 | `wake[?play=1]` | transfer playback to the gopher-spot device (recover a `device idle`); `no_device` if librespot is down. |
+| `stream` | **media-plane state** (the Icecast side, independent of the Web API `now`): `live 0\|1` (a source feeds `/spotify.mp3`, i.e. real audio vs the silence fallback) and `listeners` (external listeners, the internal drainer subtracted). Parsed from Icecast's public `status-json.xsl`; own ~2 s micro-cache; answers even with no OAuth Secret. Upstream URL from `AUDIO_STATUS_URL` (defaults to the in-cluster `audio-stream` Service). |
 | `playlists` · `playlists/<id>` | list the user's playlists; open one. **Caveat:** Spotify's Nov-2024 dev-mode block 403s playlist *track* reads for this app — even the user's own — so `playlists/<id>` returns `forbidden` today (names/ids still list, and `/spot/play?context_uri=` still plays a playlist as a context). |
 
 Errors are `key<TAB>value` too: `api` / `error <code>` / `message`. Codes:
@@ -605,7 +607,7 @@ the whole **`/spot/api/1` machine API** for the native clients (`now`/transport,
 `queue`, `cover`, `search`, `device`+`wake`, `playlists`, context play,
 `play/from` list playback), and the
 **rate-limit hardening** ([Upstream protection](#upstream-protection-spotify-rate-limits)).
-Current totals: **~44 commits, ~5,000 lines of Rust, 112 tests.**
+Current totals: **~52 commits, ~6,500 lines of Rust, 161 tests.**
 
 ---
 
@@ -616,6 +618,7 @@ gopher-spot/
 ├── README.md                         # this file
 ├── API.md                            # frozen /spot/api/1 machine-API contract
 ├── CLIENTS.md                        # client best-practices guide + spot-check checklist
+├── AUDIT-2026-07.md                  # July 2026 codebase/docs audit notes
 ├── PROMPT.md                         # original design brief (pt-BR)
 ├── Cargo.toml                        # net feature gates ureq; serde always on
 ├── src/
@@ -624,6 +627,7 @@ gopher-spot/
 │   ├── dcgi.rs                       # human selector → gophermap routing (fake-testable)
 │   ├── api.rs                        # machine API /spot/api/1 → bytes (fake-testable)
 │   ├── spotify.rs                    # SpotifyApi trait + models + blocking Client
+│   ├── stream.rs                     # /spot/api/1/stream: Icecast media-plane state (AUDIO_STATUS_URL)
 │   ├── cache.rs                      # file-backed TTL cache (byte-safe; remove)
 │   ├── latin1.rs                     # UTF-8 → Latin-1 (default, for Netscape)
 │   ├── macroman.rs                   # UTF-8 → Mac OS Roman (GOPHER_ENCODING fallback)
@@ -637,6 +641,7 @@ gopher-spot/
 │   ├── namespace.yaml
 │   ├── audio-stream.yaml             # Deployment(1, Recreate) + Service LB
 │   ├── gopher-server.yaml            # ConfigMap + Deployment(2) + Service LB
+│   ├── log-sink.yaml                 # UDP debug-telemetry sink for the native clients (Casquinha/DeToca/DeGelato)
 │   ├── secrets.yaml.template         # Web API OAuth (secrets.yaml is gitignored)
 │   └── kustomization.yaml
 └── scripts/
